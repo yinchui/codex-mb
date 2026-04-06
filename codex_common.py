@@ -113,6 +113,21 @@ ATTACHMENT_SEND_INTENT_PATTERNS = (
     "作为附件发送",
 )
 ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9_./-])(/[^\s`<>\"'，。；;]+)")
+ATTACHMENT_HINT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._-])([A-Za-z0-9][A-Za-z0-9._-]*\.(?:png|jpg|jpeg|webp|pdf|md|txt|zip))(?![A-Za-z0-9._-])",
+    re.IGNORECASE,
+)
+SENSITIVE_HOME_DIR_NAMES = {".ssh", ".gnupg", ".aws"}
+SENSITIVE_PATH_TOKENS = (
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "keychain",
+    "private_key",
+    "secret",
+    "token",
+    "credential",
+)
 
 
 def extract_local_attachment_candidates(text: str) -> List[Dict[str, str]]:
@@ -149,6 +164,50 @@ def is_attachment_send_intent(text: str) -> bool:
     if not value:
         return False
     return any(token in value for token in ATTACHMENT_SEND_INTENT_PATTERNS)
+
+
+def is_allowed_home_attachment_path(path: Path) -> Tuple[bool, Optional[str]]:
+    candidate = Path(path).expanduser()
+    ext = candidate.suffix.lower()
+    if ext not in SUPPORTED_ATTACHMENT_EXTENSIONS:
+        return False, "unsupported_type"
+
+    home = Path.home().expanduser().resolve()
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        return False, "outside_home"
+
+    try:
+        resolved.relative_to(home)
+    except ValueError:
+        return False, "outside_home"
+
+    lowered_parts = {part.lower() for part in resolved.parts}
+    if SENSITIVE_HOME_DIR_NAMES & lowered_parts:
+        return False, "sensitive_path"
+
+    lowered_path = str(resolved).lower()
+    if any(token in lowered_path for token in SENSITIVE_PATH_TOKENS):
+        return False, "sensitive_path"
+
+    return True, None
+
+
+def extract_attachment_name_hints(text: str) -> List[str]:
+    value = str(text or "")
+    names: List[str] = []
+    seen: Set[str] = set()
+    for match in ATTACHMENT_HINT_PATTERN.findall(value):
+        name = str(match or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
 
 
 class SessionStore:

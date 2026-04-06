@@ -9,8 +9,10 @@ from codex_common import (
     BotState,
     CodexRunner,
     ProviderLookupError,
+    extract_attachment_name_hints,
     extract_local_attachment_candidates,
     fetch_provider_account_info,
+    is_allowed_home_attachment_path,
     is_attachment_send_intent,
     list_provider_models,
     load_codex_api_key,
@@ -150,6 +152,85 @@ class BotStateModelTests(unittest.TestCase):
 
 
 class AttachmentHelpersTests(unittest.TestCase):
+    def test_is_allowed_home_attachment_path_accepts_supported_file_under_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / "Desktop" / "paper.pdf"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("ok", encoding="utf-8")
+
+            with patch("codex_common.Path.home", return_value=home):
+                allowed, reason = is_allowed_home_attachment_path(target)
+
+            self.assertTrue(allowed)
+            self.assertIsNone(reason)
+
+    def test_is_allowed_home_attachment_path_rejects_unsupported_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / "Desktop" / "archive.bin"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("no", encoding="utf-8")
+
+            with patch("codex_common.Path.home", return_value=home):
+                allowed, reason = is_allowed_home_attachment_path(target)
+
+            self.assertFalse(allowed)
+            self.assertEqual(reason, "unsupported_type")
+
+    def test_is_allowed_home_attachment_path_rejects_outside_home(self) -> None:
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as outside_dir:
+            home = Path(home_dir)
+            target = Path(outside_dir) / "a.pdf"
+            target.write_text("x", encoding="utf-8")
+
+            with patch("codex_common.Path.home", return_value=home):
+                allowed, reason = is_allowed_home_attachment_path(target)
+
+            self.assertFalse(allowed)
+            self.assertEqual(reason, "outside_home")
+
+    def test_is_allowed_home_attachment_path_rejects_sensitive_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            samples = [
+                home / ".ssh" / "config.txt",
+                home / ".gnupg" / "a.txt",
+                home / ".aws" / "credentials.txt",
+                home / "Desktop" / ".env.txt",
+                home / "Desktop" / "id_rsa.txt",
+                home / "Desktop" / "id_ed25519.md",
+                home / "Desktop" / "keychain.txt",
+                home / "Desktop" / "private_key.txt",
+                home / "Desktop" / "secret_notes.txt",
+                home / "Desktop" / "token_store.txt",
+                home / "Desktop" / "credential_dump.txt",
+            ]
+            for path in samples:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x", encoding="utf-8")
+                with patch("codex_common.Path.home", return_value=home):
+                    allowed, reason = is_allowed_home_attachment_path(path)
+                self.assertFalse(allowed)
+                self.assertEqual(reason, "sensitive_path")
+
+    def test_extract_attachment_name_hints_finds_supported_file_names(self) -> None:
+        text = "Kimi_Attention_Residuals_2603.15031.pdf，把这个发给我"
+        self.assertEqual(
+            extract_attachment_name_hints(text),
+            ["Kimi_Attention_Residuals_2603.15031.pdf"],
+        )
+
+    def test_extract_attachment_name_hints_matches_when_adjacent_to_chinese_text(self) -> None:
+        self.assertEqual(
+            extract_attachment_name_hints("把Kimi_Attention_Residuals_2603.15031.pdf发给我"),
+            ["Kimi_Attention_Residuals_2603.15031.pdf"],
+        )
+        self.assertEqual(
+            extract_attachment_name_hints("文件Kimi_Attention_Residuals_2603.15031.pdf"),
+            ["Kimi_Attention_Residuals_2603.15031.pdf"],
+        )
+
     def test_extract_local_attachment_candidates_keeps_existing_absolute_supported_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
