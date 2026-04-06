@@ -859,6 +859,33 @@ def load_codex_base_url(config_path: Optional[Path] = None) -> Optional[str]:
     return provider_base_urls.get(active_provider)
 
 
+def load_codex_default_model(config_path: Optional[Path] = None) -> Optional[str]:
+    target = (config_path or resolve_codex_config_path()).expanduser()
+    if not target.exists():
+        return None
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+    current_section: Optional[str] = None
+    for raw_line in lines:
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line[1:-1].strip()
+            continue
+        if current_section:
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "model":
+            model = _parse_toml_string(value)
+            return model or None
+    return None
+
+
 def load_codex_api_key(auth_path: Optional[Path] = None) -> Optional[str]:
     target = (auth_path or resolve_codex_auth_path()).expanduser()
     if not target.exists():
