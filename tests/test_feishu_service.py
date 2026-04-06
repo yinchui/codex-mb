@@ -385,6 +385,51 @@ class FeishuModelAccountTests(unittest.TestCase):
 
             self.assertEqual(codex.calls[-1]["model"], "gpt-5.3")
 
+    def test_prompt_worker_stores_recent_attachments_when_answer_has_valid_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, _, state, _ = self.build_service(root)
+            image_path = root / "preview.png"
+            image_path.write_bytes(b"image-bytes")
+
+            service._run_prompt_worker(
+                chat_id="chat-1",
+                actor_id="user-1",
+                prompt=f"请查看这个文件：{image_path}",
+                active_id=None,
+                cwd=root,
+                session_label="新会话 | tmp",
+            )
+
+            attachments = state.get_recent_attachments("chat-1::user-1")
+            self.assertEqual(len(attachments), 1)
+            self.assertEqual(attachments[0]["path"], str(image_path))
+            self.assertEqual(attachments[0]["kind"], "image")
+            self.assertEqual(attachments[0]["name"], "preview.png")
+
+    def test_prompt_worker_does_not_update_recent_attachments_when_no_valid_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, _, state, _ = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": "/tmp/old.txt", "kind": "file", "name": "old.txt"}],
+            )
+
+            service._run_prompt_worker(
+                chat_id="chat-1",
+                actor_id="user-1",
+                prompt="这次回复里没有可用附件路径",
+                active_id=None,
+                cwd=root,
+                session_label="新会话 | tmp",
+            )
+
+            self.assertEqual(
+                state.get_recent_attachments("chat-1::user-1"),
+                [{"path": "/tmp/old.txt", "kind": "file", "name": "old.txt"}],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

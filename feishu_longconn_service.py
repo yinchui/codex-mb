@@ -23,6 +23,7 @@ from codex_common import (
     SessionStore,
     chunk_text,
     env,
+    extract_local_attachment_candidates,
     fetch_provider_account_info,
     list_provider_models,
     load_codex_default_model,
@@ -1019,6 +1020,10 @@ class FeishuCodexService:
             return raw[:max_size]
         return raw[:keep] + "…" + suffix
 
+    @staticmethod
+    def _attachment_state_key(chat_id: str, actor_id: str) -> str:
+        return f"{chat_id}::{actor_id}"
+
     def _finalize_stream_reply(
         self,
         chat_id: str,
@@ -1255,6 +1260,12 @@ class FeishuCodexService:
                 answer = f"{note}\n\n{answer}"
 
         answer = self._format_prompt_response(final_session_label, answer)
+        attachment_candidates = extract_local_attachment_candidates(answer)
+        if attachment_candidates:
+            self.state.set_recent_attachments(
+                self._attachment_state_key(chat_id, actor_id),
+                attachment_candidates,
+            )
         if use_stream and stream_message_id:
             replay = int(stream_state.get("content_updates") or 0) == 0
             self._finalize_stream_reply(chat_id, stream_message_id, answer, progressive_replay=replay)
