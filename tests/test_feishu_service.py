@@ -441,7 +441,7 @@ class FeishuModelAccountTests(unittest.TestCase):
                 [{"path": "/tmp/old.txt", "kind": "file", "name": "old.txt"}],
             )
 
-    def test_prompt_worker_includes_safe_attachment_output_dir_instruction(self) -> None:
+    def test_prompt_worker_includes_preferred_attachment_output_dir_instruction(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             service, _, _, codex = self.build_service(root)
@@ -457,7 +457,10 @@ class FeishuModelAccountTests(unittest.TestCase):
 
             prompt = codex.calls[-1]["prompt"]
             self.assertIn(str(root / "attachments"), prompt)
-            self.assertIn("不要保存到 ~/Desktop", prompt)
+            self.assertIn("优先保存到这个目录", prompt)
+            self.assertIn("尽量不要保存到 ~/Desktop、~/Documents、~/Downloads，除非用户明确要求。", prompt)
+            self.assertIn("最终回复里请使用绝对路径 Markdown 链接", prompt)
+            self.assertNotIn("必须保存到这个目录", prompt)
 
     def test_send_intent_auto_sends_single_recent_image(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

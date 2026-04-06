@@ -647,10 +647,10 @@ class FeishuCodexService:
         guidance = "\n".join(
             [
                 "[飞书附件约束]",
-                "如果你要创建任何本地文件、截图、导出结果，并准备稍后发回飞书聊天，必须保存到这个目录：",
+                "如果你要创建任何本地文件、截图、导出结果，并准备稍后发回飞书聊天，优先保存到这个目录：",
                 str(attachment_dir),
                 "最终回复里请使用绝对路径 Markdown 链接，例如 [文件名](/abs/path/file.png)。",
-                "不要保存到 ~/Desktop、~/Documents、~/Downloads。",
+                "尽量不要保存到 ~/Desktop、~/Documents、~/Downloads，除非用户明确要求。",
                 "如果这次不需要创建文件，就按正常方式回答。",
             ]
         )
