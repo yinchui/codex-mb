@@ -1487,6 +1487,10 @@ class FeishuCodexService:
             thinking_stop.set()
             if thinking_thread is not None:
                 thinking_thread.join(timeout=0.3)
+            self.state.set_recent_attachments(
+                self._attachment_state_key(chat_id, actor_id),
+                [],
+            )
             err_msg = self._format_prompt_response(
                 session_label,
                 f"调用 Codex 时出现异常: {e}",
@@ -1512,6 +1516,7 @@ class FeishuCodexService:
 
         final_session_id = thread_id or active_id
         final_session_label = self._session_label(final_session_id, cwd)
+        attachment_state_key = self._attachment_state_key(chat_id, actor_id)
         session_updated = False
         if thread_id:
             session_updated = self.state.update_active_session_if_unchanged(
@@ -1522,6 +1527,7 @@ class FeishuCodexService:
             )
 
         if return_code != 0:
+            self.state.set_recent_attachments(attachment_state_key, [])
             msg = f"Codex 执行失败 (exit={return_code})\n{answer}"
             if stderr_text:
                 msg += f"\n\nstderr:\n{stderr_text[-1200:]}"
@@ -1544,9 +1550,11 @@ class FeishuCodexService:
         attachment_candidates = extract_local_attachment_candidates(answer)
         if attachment_candidates:
             self.state.set_recent_attachments(
-                self._attachment_state_key(chat_id, actor_id),
+                attachment_state_key,
                 attachment_candidates,
             )
+        else:
+            self.state.set_recent_attachments(attachment_state_key, [])
         if use_stream and stream_message_id:
             replay = int(stream_state.get("content_updates") or 0) == 0
             self._finalize_stream_reply(chat_id, stream_message_id, answer, progressive_replay=replay)

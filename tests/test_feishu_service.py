@@ -418,7 +418,7 @@ class FeishuModelAccountTests(unittest.TestCase):
             self.assertEqual(attachments[0]["kind"], "image")
             self.assertEqual(attachments[0]["name"], "preview.png")
 
-    def test_prompt_worker_does_not_update_recent_attachments_when_no_valid_path(self) -> None:
+    def test_prompt_worker_clears_recent_attachments_when_no_valid_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             service, _, state, _ = self.build_service(root)
@@ -436,10 +436,114 @@ class FeishuModelAccountTests(unittest.TestCase):
                 session_label="新会话 | tmp",
             )
 
-            self.assertEqual(
-                state.get_recent_attachments("chat-1::user-1"),
-                [{"path": "/tmp/old.txt", "kind": "file", "name": "old.txt"}],
+            self.assertEqual(state.get_recent_attachments("chat-1::user-1"), [])
+
+    def test_prompt_worker_failure_clears_stale_recent_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            stale_path = root / "old.txt"
+            stale_path.write_text("stale", encoding="utf-8")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(stale_path), "kind": "file", "name": "old.txt"}],
             )
+
+            def _run_prompt(*args, **kwargs):
+                return ("thread-123", "执行失败", "boom stderr", 1)
+
+            codex.run_prompt = _run_prompt
+            service._run_prompt_worker(
+                chat_id="chat-1",
+                actor_id="user-1",
+                prompt="hello",
+                active_id=None,
+                cwd=root,
+                session_label="新会话 | tmp",
+            )
+
+            self.assertIn("Codex 执行失败 (exit=1)", api.sent_messages[-1][1])
+            self.assertIn("boom stderr", api.sent_messages[-1][1])
+
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "发给我")
+
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(api.sent_files, [])
+            self.assertIn("当前没有可发送", api.sent_messages[-1][1])
+
+    def test_prompt_worker_still_sends_final_reply_when_answer_has_permission_denied_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            blocked_path = Path("/private/var/tcc-blocked.png")
+            original_exists = Path.exists
+
+            def _run_prompt(*args, **kwargs):
+                return ("thread-123", f"请查看这个路径：{blocked_path}", "", 0)
+
+            def _exists_with_permission_denied(path_obj):
+                if path_obj == blocked_path:
+                    raise OSError("Operation not permitted")
+                return original_exists(path_obj)
+
+            codex.run_prompt = _run_prompt
+            with patch("codex_common.Path.exists", new=_exists_with_permission_denied):
+                service._run_prompt_worker(
+                    chat_id="chat-1",
+                    actor_id="user-1",
+                    prompt="hello",
+                    active_id=None,
+                    cwd=root,
+                    session_label="新会话 | tmp",
+                )
+
+            self.assertEqual(state.get_active("user-1")[0], "thread-123")
+            self.assertEqual(len(api.sent_messages), 1)
+            self.assertIn(str(blocked_path), api.sent_messages[-1][1])
+
+    def test_prompt_worker_permission_denied_answer_clears_stale_recent_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            stale_path = root / "old.txt"
+            stale_path.write_text("stale", encoding="utf-8")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(stale_path), "kind": "file", "name": "old.txt"}],
+            )
+            blocked_path = Path("/private/var/tcc-only.png")
+            original_exists = Path.exists
+
+            def _run_prompt(*args, **kwargs):
+                return ("thread-123", f"请查看这个路径：{blocked_path}", "", 0)
+
+            def _exists_with_permission_denied(path_obj):
+                if path_obj == blocked_path:
+                    raise OSError("Operation not permitted")
+                return original_exists(path_obj)
+
+            codex.run_prompt = _run_prompt
+            with patch("codex_common.Path.exists", new=_exists_with_permission_denied):
+                service._run_prompt_worker(
+                    chat_id="chat-1",
+                    actor_id="user-1",
+                    prompt="hello",
+                    active_id=None,
+                    cwd=root,
+                    session_label="新会话 | tmp",
+                )
+
+            self.assertEqual(len(api.sent_messages), 1)
+            self.assertIn(str(blocked_path), api.sent_messages[-1][1])
+            self.assertEqual(state.get_recent_attachments("chat-1::user-1"), [])
+
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "发给我")
+
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(api.sent_files, [])
+            self.assertIn("没有可发送", api.sent_messages[-1][1])
 
     def test_prompt_worker_includes_preferred_attachment_output_dir_instruction(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

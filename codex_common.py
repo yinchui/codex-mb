@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import errno
 import os
 import re
 import shutil
@@ -130,6 +131,24 @@ SENSITIVE_PATH_TOKENS = (
 )
 
 
+def _is_permission_shaped_os_error(exc: OSError) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM):
+        return True
+    message = str(exc).strip().lower()
+    if not message:
+        return False
+    return any(
+        token in message
+        for token in (
+            "operation not permitted",
+            "permission denied",
+            "access denied",
+        )
+    )
+
+
 def extract_local_attachment_candidates(text: str) -> List[Dict[str, str]]:
     value = str(text or "")
     candidates: List[Dict[str, str]] = []
@@ -143,7 +162,14 @@ def extract_local_attachment_candidates(text: str) -> List[Dict[str, str]]:
         kind = SUPPORTED_ATTACHMENT_EXTENSIONS.get(ext)
         if not kind:
             continue
-        if not path.exists() or not path.is_file():
+        try:
+            exists = path.exists()
+            is_file = path.is_file() if exists else False
+        except OSError as exc:
+            if _is_permission_shaped_os_error(exc):
+                continue
+            raise
+        if not exists or not is_file:
             continue
         normalized = str(path)
         if normalized in seen:

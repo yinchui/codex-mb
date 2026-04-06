@@ -299,6 +299,29 @@ class AttachmentHelpersTests(unittest.TestCase):
                 [{"path": str(image_path), "kind": "image", "name": "shot.png"}],
             )
 
+    def test_extract_local_attachment_candidates_skips_permission_denied_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            readable_path = root / "readable.png"
+            readable_path.write_text("png", encoding="utf-8")
+            blocked_path = Path("/private/var/tcc-blocked.png")
+            original_exists = Path.exists
+
+            def _exists_with_permission_denied(path_obj):
+                if path_obj == blocked_path:
+                    raise OSError("Operation not permitted")
+                return original_exists(path_obj)
+
+            text = "\n".join([f"blocked: {blocked_path}", f"readable: {readable_path}"])
+
+            with patch("codex_common.Path.exists", new=_exists_with_permission_denied):
+                candidates = extract_local_attachment_candidates(text)
+
+            self.assertEqual(
+                candidates,
+                [{"path": str(readable_path), "kind": "image", "name": "readable.png"}],
+            )
+
     def test_bot_state_persists_recent_attachments_and_picker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = BotState(Path(tmpdir) / "state.json")
