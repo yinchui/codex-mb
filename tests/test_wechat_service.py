@@ -5,6 +5,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from codex_common import BotState, SessionStore
 from wechat_codex_service import (
@@ -51,8 +52,8 @@ class FakeCodexRunner:
     def __init__(self) -> None:
         self.calls = []
 
-    def run_prompt(self, prompt, cwd, session_id=None, on_update=None):
-        self.calls.append((prompt, str(cwd), session_id))
+    def run_prompt(self, prompt, cwd, session_id=None, model=None, on_update=None):
+        self.calls.append((prompt, str(cwd), session_id, model))
         return ("thread-123", f"answer:{prompt}", "", 0)
 
 
@@ -282,6 +283,171 @@ class WechatServiceTests(unittest.TestCase):
                 "wechat prompt should not emit the removed ack text",
             )
             self.assertTrue(any("answer:hello" in text for _, _, text in api.sent))
+
+    def test_model_command_lists_provider_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            api = RecordingWechatAPI()
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=BotState(root / "state.json"),
+                codex=FakeCodexRunner(),
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            with patch(
+                "wechat_codex_service.list_provider_models",
+                return_value=["gpt-5.4", "gpt-5.3"],
+            ), patch(
+                "wechat_codex_service.load_codex_default_model",
+                return_value="gpt-5.4",
+            ):
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 10,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-model",
+                        "item_list": [{"type": 1, "text_item": {"text": "/model"}}],
+                    }
+                )
+
+            text = api.sent[-1][2]
+            self.assertIn("当前模型", text)
+            self.assertIn("1. gpt-5.4", text)
+            self.assertIn("2. gpt-5.3", text)
+
+    def test_model_pick_persists_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            api = RecordingWechatAPI()
+            state = BotState(root / "state.json")
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=state,
+                codex=FakeCodexRunner(),
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            with patch(
+                "wechat_codex_service.list_provider_models",
+                return_value=["gpt-5.4", "gpt-5.3"],
+            ), patch(
+                "wechat_codex_service.load_codex_default_model",
+                return_value="gpt-5.4",
+            ):
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 11,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-model-1",
+                        "item_list": [{"type": 1, "text_item": {"text": "/model"}}],
+                    }
+                )
+
+            service._handle_message(
+                {
+                    "message_type": 1,
+                    "message_id": 12,
+                    "from_user_id": "user@im.wechat",
+                    "context_token": "ctx-model-2",
+                    "item_list": [{"type": 1, "text_item": {"text": "2"}}],
+                }
+            )
+
+            self.assertEqual(state.get_selected_model("user@im.wechat"), "gpt-5.3")
+            self.assertFalse(state.is_pending_model_pick("user@im.wechat"))
+            self.assertIn("gpt-5.3", api.sent[-1][2])
+
+    def test_account_command_formats_quota_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            api = RecordingWechatAPI()
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=BotState(root / "state.json"),
+                codex=FakeCodexRunner(),
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            payload = {
+                "sub_service_type_name": "Codex Core",
+                "billing_type": "duration",
+                "quota": {
+                    "daily_quota": 9000,
+                    "daily_spent": 240,
+                    "daily_remaining": 8760,
+                    "next_reset_at": "2026-04-07T00:00:00+08:00",
+                },
+                "usage": {
+                    "daily_request_count": 40,
+                },
+            }
+
+            with patch(
+                "wechat_codex_service.fetch_provider_account_info",
+                return_value=payload,
+            ):
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 13,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-account",
+                        "item_list": [{"type": 1, "text_item": {"text": "/account"}}],
+                    }
+                )
+
+            text = api.sent[-1][2]
+            self.assertIn("今日剩余", text)
+            self.assertIn("8760", text)
+            self.assertIn("40", text)
+
+    def test_prompt_worker_uses_selected_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            api = RecordingWechatAPI()
+            state = BotState(root / "state.json")
+            codex = FakeCodexRunner()
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=state,
+                codex=codex,
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            state.set_selected_model("user@im.wechat", "gpt-5.3")
+            service._run_prompt_worker(
+                actor_id="user@im.wechat",
+                context_token="ctx-prompt",
+                prompt="hello",
+                active_id=None,
+                cwd=root,
+                session_label="新会话 | tmp",
+            )
+
+            self.assertEqual(codex.calls[-1][3], "gpt-5.3")
 
 
 if __name__ == "__main__":
