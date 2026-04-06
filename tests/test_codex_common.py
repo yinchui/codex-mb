@@ -9,11 +9,14 @@ from codex_common import (
     BotState,
     CodexRunner,
     ProviderLookupError,
+    SessionMeta,
     extract_attachment_name_hints,
     extract_local_attachment_candidates,
     fetch_provider_account_info,
+    group_sessions_by_workspace,
     is_allowed_home_attachment_path,
     is_attachment_send_intent,
+    is_compound_attachment_send_intent,
     list_provider_models,
     load_codex_api_key,
     load_codex_base_url,
@@ -150,6 +153,83 @@ class BotStateModelTests(unittest.TestCase):
             self.assertFalse(state.is_pending_model_pick("user-1"))
             self.assertEqual(state.get_model_picker("user-1"), {})
 
+    def test_bot_state_tracks_pending_workspace_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+
+            state.set_workspace_picker(
+                "user-1",
+                [
+                    {
+                        "cwd": "/tmp/workspace-a",
+                        "label": "workspace-a",
+                        "session_ids": ["sess-1", "sess-2"],
+                    }
+                ],
+            )
+
+            self.assertTrue(state.is_pending_workspace_pick("user-1"))
+            self.assertEqual(
+                state.get_workspace_picker("user-1"),
+                {
+                    "workspaces": [
+                        {
+                            "cwd": "/tmp/workspace-a",
+                            "label": "workspace-a",
+                            "session_ids": ["sess-1", "sess-2"],
+                        }
+                    ]
+                },
+            )
+
+            state.clear_workspace_picker("user-1")
+
+            self.assertFalse(state.is_pending_workspace_pick("user-1"))
+            self.assertEqual(state.get_workspace_picker("user-1"), {})
+
+
+class SessionGroupingTests(unittest.TestCase):
+    def test_group_sessions_by_workspace_preserves_recent_group_order(self) -> None:
+        items = [
+            SessionMeta(
+                session_id="sess-1",
+                timestamp="2026-04-06T10:00:00Z",
+                cwd="/tmp/workspace-a",
+                file_path="/tmp/sess-1.jsonl",
+                title="first prompt",
+            ),
+            SessionMeta(
+                session_id="sess-2",
+                timestamp="2026-04-06T09:00:00Z",
+                cwd="/tmp/workspace-b",
+                file_path="/tmp/sess-2.jsonl",
+                title="second prompt",
+            ),
+            SessionMeta(
+                session_id="sess-3",
+                timestamp="2026-04-06T08:00:00Z",
+                cwd="/tmp/workspace-a",
+                file_path="/tmp/sess-3.jsonl",
+                title="third prompt",
+            ),
+        ]
+
+        self.assertEqual(
+            group_sessions_by_workspace(items),
+            [
+                {
+                    "cwd": "/tmp/workspace-a",
+                    "label": "workspace-a",
+                    "session_ids": ["sess-1", "sess-3"],
+                },
+                {
+                    "cwd": "/tmp/workspace-b",
+                    "label": "workspace-b",
+                    "session_ids": ["sess-2"],
+                },
+            ],
+        )
+
 
 class AttachmentHelpersTests(unittest.TestCase):
     def test_is_allowed_home_attachment_path_accepts_supported_file_under_home(self) -> None:
@@ -271,6 +351,15 @@ class AttachmentHelpersTests(unittest.TestCase):
         self.assertTrue(is_attachment_send_intent("把文件发来"))
         self.assertTrue(is_attachment_send_intent("作为附件发送"))
         self.assertFalse(is_attachment_send_intent("你好，今天天气怎么样"))
+
+    def test_is_compound_attachment_send_intent_matches_action_plus_send_phrase(self) -> None:
+        self.assertTrue(is_compound_attachment_send_intent("把这个文件夹压缩成压缩包然后发给我"))
+        self.assertTrue(is_compound_attachment_send_intent("生成一张图再发给我"))
+
+    def test_is_compound_attachment_send_intent_ignores_plain_send_phrase(self) -> None:
+        self.assertFalse(is_compound_attachment_send_intent("发给我"))
+        self.assertFalse(is_compound_attachment_send_intent("report.pdf，把这个发给我"))
+        self.assertFalse(is_compound_attachment_send_intent("把压缩包发给我"))
 
     def test_extract_local_attachment_candidates_deduplicates_same_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

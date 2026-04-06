@@ -113,6 +113,32 @@ ATTACHMENT_SEND_INTENT_PATTERNS = (
     "把文件发来",
     "作为附件发送",
 )
+COMPOUND_ATTACHMENT_ACTION_PATTERNS = (
+    "压缩成",
+    "压缩一下",
+    "打包成",
+    "打包一下",
+    "归档成",
+    "归档一下",
+    "生成一",
+    "生成个",
+    "生成份",
+    "生成张",
+    "生成后",
+    "导出一",
+    "导出个",
+    "导出份",
+    "导出后",
+    "保存成",
+    "保存到",
+    "保存后",
+    "整理成",
+    "整理后",
+    "整理一下",
+    "截个图",
+    "截一张图",
+    "截张图",
+)
 ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9_./-])(/[^\s`<>\"'，。；;]+)")
 ATTACHMENT_HINT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9._-])([A-Za-z0-9][A-Za-z0-9._-]*\.(?:png|jpg|jpeg|webp|pdf|md|txt|zip))(?![A-Za-z0-9._-])",
@@ -190,6 +216,13 @@ def is_attachment_send_intent(text: str) -> bool:
     if not value:
         return False
     return any(token in value for token in ATTACHMENT_SEND_INTENT_PATTERNS)
+
+
+def is_compound_attachment_send_intent(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value or not is_attachment_send_intent(value):
+        return False
+    return any(token in value for token in COMPOUND_ATTACHMENT_ACTION_PATTERNS)
 
 
 def is_allowed_home_attachment_path(path: Path) -> Tuple[bool, Optional[str]]:
@@ -389,6 +422,29 @@ class SessionStore:
         return one_line[: limit - 1] + "…"
 
 
+def workspace_label_for_cwd(cwd: str) -> str:
+    value = str(cwd or "").strip() or "unknown"
+    return Path(value).name or value
+
+
+def group_sessions_by_workspace(items: List[SessionMeta]) -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = []
+    index_by_cwd: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        cwd = str(item.cwd or "").strip() or "unknown"
+        group = index_by_cwd.get(cwd)
+        if group is None:
+            group = {
+                "cwd": cwd,
+                "label": workspace_label_for_cwd(cwd),
+                "session_ids": [],
+            }
+            index_by_cwd[cwd] = group
+            groups.append(group)
+        group["session_ids"].append(item.session_id)
+    return groups
+
+
 class BotState:
     def __init__(self, path: Path):
         self.path = path
@@ -487,6 +543,54 @@ class BotState:
         with self._lock:
             user_data = self._get_user_unlocked(user_id)
             return bool(user_data.get("pending_session_pick"))
+
+    def set_workspace_picker(self, user_id: StateActor, workspaces: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            normalized: List[Dict[str, Any]] = []
+            for item in workspaces:
+                if not isinstance(item, dict):
+                    continue
+                cwd = str(item.get("cwd") or "").strip() or "unknown"
+                label = str(item.get("label") or "").strip() or workspace_label_for_cwd(cwd)
+                raw_ids = item.get("session_ids")
+                if not isinstance(raw_ids, list):
+                    continue
+                session_ids = [str(session_id).strip() for session_id in raw_ids if str(session_id).strip()]
+                if not session_ids:
+                    continue
+                normalized.append(
+                    {
+                        "cwd": cwd,
+                        "label": label,
+                        "session_ids": session_ids,
+                    }
+                )
+            if normalized:
+                user_data["pending_workspace_pick"] = True
+                user_data["workspace_picker"] = {"workspaces": normalized}
+            else:
+                user_data["pending_workspace_pick"] = False
+                user_data.pop("workspace_picker", None)
+            self._save_unlocked()
+
+    def is_pending_workspace_pick(self, user_id: StateActor) -> bool:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            return bool(user_data.get("pending_workspace_pick"))
+
+    def get_workspace_picker(self, user_id: StateActor) -> Dict[str, Any]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            picker = user_data.get("workspace_picker")
+            return dict(picker) if isinstance(picker, dict) else {}
+
+    def clear_workspace_picker(self, user_id: StateActor) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["pending_workspace_pick"] = False
+            user_data.pop("workspace_picker", None)
+            self._save_unlocked()
 
     def update_active_session_if_unchanged(
         self,

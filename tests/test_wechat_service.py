@@ -232,7 +232,9 @@ class WechatServiceTests(unittest.TestCase):
                     "item_list": [{"type": 1, "text_item": {"text": "/sessions"}}],
                 }
             )
-            self.assertTrue(any("最近会话" in text for _, _, text in api.sent))
+            self.assertTrue(any("最近工作区" in text for _, _, text in api.sent))
+            self.assertTrue(state.is_pending_workspace_pick("user@im.wechat"))
+            self.assertFalse(state.is_pending_session_pick("user@im.wechat"))
 
             service._handle_message(
                 {
@@ -243,8 +245,11 @@ class WechatServiceTests(unittest.TestCase):
                     "item_list": [{"type": 1, "text_item": {"text": "1"}}],
                 }
             )
+            self.assertFalse(state.is_pending_workspace_pick("user@im.wechat"))
+            self.assertTrue(state.is_pending_session_pick("user@im.wechat"))
             active_id, _ = state.get_active("user@im.wechat")
-            self.assertEqual(active_id, "sess-1")
+            self.assertIsNone(active_id)
+            self.assertTrue(any("最近会话" in text for _, _, text in api.sent))
 
             service._handle_message(
                 {
@@ -252,10 +257,22 @@ class WechatServiceTests(unittest.TestCase):
                     "message_id": 3,
                     "from_user_id": "user@im.wechat",
                     "context_token": "ctx-3",
+                    "item_list": [{"type": 1, "text_item": {"text": "1"}}],
+                }
+            )
+            active_id, _ = state.get_active("user@im.wechat")
+            self.assertEqual(active_id, "sess-1")
+
+            service._handle_message(
+                {
+                    "message_type": 1,
+                    "message_id": 4,
+                    "from_user_id": "user@im.wechat",
+                    "context_token": "ctx-4",
                     "item_list": [{"type": 1, "text_item": {"text": "继续这个会话"}}],
                 }
             )
-            self.assertEqual(service.prompt_requests[-1], ("user@im.wechat", "ctx-3", "继续这个会话"))
+            self.assertEqual(service.prompt_requests[-1], ("user@im.wechat", "ctx-4", "继续这个会话"))
 
     def test_prompt_worker_sends_final_answer(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -421,6 +438,19 @@ class WechatServiceTests(unittest.TestCase):
                     "message_id": 22,
                     "from_user_id": "user@im.wechat",
                     "context_token": "ctx-pick",
+                    "item_list": [{"type": 1, "text_item": {"text": "1"}}],
+                }
+            )
+            self.assertTrue(state.is_pending_session_pick("user@im.wechat"))
+            self.assertFalse(state.is_pending_workspace_pick("user@im.wechat"))
+            self.assertIsNone(state.get_active("user@im.wechat")[0])
+
+            service._handle_message(
+                {
+                    "message_type": 1,
+                    "message_id": 23,
+                    "from_user_id": "user@im.wechat",
+                    "context_token": "ctx-pick-2",
                     "item_list": [{"type": 1, "text_item": {"text": "1"}}],
                 }
             )

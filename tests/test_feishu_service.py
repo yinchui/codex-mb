@@ -41,6 +41,7 @@ class FakeFeishuAPI:
         self.sent_messages = []
         self.sent_images = []
         self.sent_files = []
+        self.last_attachment_error = None
 
     def send_message(self, chat_id: str, text: str) -> bool:
         self.sent_messages.append((chat_id, text))
@@ -65,6 +66,11 @@ class FakeFeishuAPI:
     def send_file_path(self, chat_id: str, path: Path) -> bool:
         self.sent_files.append((chat_id, str(path)))
         return True
+
+    def consume_last_attachment_error(self):
+        message = self.last_attachment_error
+        self.last_attachment_error = None
+        return message
 
 
 class FakeCodexRunner:
@@ -269,6 +275,74 @@ class FeishuApiAttachmentTests(unittest.TestCase):
             self.assertFalse(ok)
             mock_log.assert_called_once()
 
+    def test_send_file_path_splits_oversized_file_and_sends_parts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "archive.zip"
+            file_path.write_bytes(b"abcdefghijklm")
+            fake_client = _FakeFeishuClient()
+            api = self._build_api_with_fake_client(fake_client)
+
+            with patch("feishu_longconn_service.FEISHU_MAX_FILE_SIZE_BYTES", 10), patch(
+                "feishu_longconn_service.FEISHU_FILE_PART_SIZE_BYTES",
+                6,
+            ):
+                ok = api.send_file_path("chat-1", file_path)
+
+            self.assertTrue(ok)
+            self.assertEqual(len(fake_client.file_create_requests), 3)
+            self.assertEqual(
+                [req.request_body.file_name for req in fake_client.file_create_requests],
+                [
+                    "archive.zip.part01",
+                    "archive.zip.part02",
+                    "archive.zip.part03",
+                ],
+            )
+            self.assertEqual(
+                [req.request_body.msg_type for req in fake_client.message_create_requests],
+                ["file", "file", "file", "text"],
+            )
+            followup = json.loads(fake_client.message_create_requests[-1].request_body.content)["text"]
+            self.assertIn("archive.zip", followup)
+            self.assertIn("3 片", followup)
+            self.assertIn("cat archive.zip.part*", followup)
+            self.assertIsNone(api.consume_last_attachment_error())
+
+    def test_send_file_path_split_failure_reports_part_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "archive.zip"
+            file_path.write_bytes(b"abcdefghijklm")
+            fake_client = _FakeFeishuClient()
+            api = self._build_api_with_fake_client(fake_client)
+            call_count = {"value": 0}
+
+            def _file_create_fail_on_second(request):
+                call_count["value"] += 1
+                fake_client.file_create_requests.append(request)
+                if call_count["value"] == 2:
+                    return _FakeLarkResponse(ok=False)
+                data = type("FileData", (), {"file_key": f"file-key-{call_count['value']}"})()
+                return _FakeLarkResponse(ok=True, data=data)
+
+            fake_client.im.v1.file.create = _file_create_fail_on_second
+
+            with patch("feishu_longconn_service.FEISHU_MAX_FILE_SIZE_BYTES", 10), patch(
+                "feishu_longconn_service.FEISHU_FILE_PART_SIZE_BYTES",
+                6,
+            ):
+                ok = api.send_file_path("chat-1", file_path)
+
+            self.assertFalse(ok)
+            self.assertEqual(len(fake_client.file_create_requests), 2)
+            self.assertEqual(
+                [req.request_body.msg_type for req in fake_client.message_create_requests],
+                ["file"],
+            )
+            error_message = api.consume_last_attachment_error()
+            self.assertIsInstance(error_message, str)
+            self.assertIn("第 2/3 片", error_message)
+            self.assertIn("archive.zip", error_message)
+
 
 class FeishuModelAccountTests(unittest.TestCase):
     def build_service(self, root: Path):
@@ -332,7 +406,7 @@ class FeishuModelAccountTests(unittest.TestCase):
     def test_sessions_command_clears_pending_model_picker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            service, _, state, _ = self.build_service(root)
+            service, api, state, _ = self.build_service(root)
 
             with patch(
                 "feishu_longconn_service.list_provider_models",
@@ -344,6 +418,17 @@ class FeishuModelAccountTests(unittest.TestCase):
                 service._handle_text("chat-1", "user-1", "/model")
 
             service._handle_text("chat-1", "user-1", "/sessions")
+            self.assertTrue(state.is_pending_workspace_pick("user-1"))
+            self.assertFalse(state.is_pending_session_pick("user-1"))
+            self.assertIn("最近工作区", api.sent_messages[-1][1])
+
+            service._handle_text("chat-1", "user-1", "1")
+
+            self.assertFalse(state.is_pending_workspace_pick("user-1"))
+            self.assertTrue(state.is_pending_session_pick("user-1"))
+            self.assertIsNone(state.get_active("user-1")[0])
+            self.assertIn("最近会话", api.sent_messages[-1][1])
+
             service._handle_text("chat-1", "user-1", "1")
 
             self.assertEqual(state.get_active("user-1")[0], "sess-1")
@@ -810,6 +895,52 @@ class FeishuModelAccountTests(unittest.TestCase):
             self.assertEqual(codex.calls, [])
             self.assertIn("没有可发送", api.sent_messages[-1][1])
 
+    def test_compound_action_plus_send_phrase_routes_to_run_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            stale_path = root / "notes.txt"
+            stale_path.write_text("hello", encoding="utf-8")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(stale_path), "kind": "file", "name": "notes.txt"}],
+            )
+            captured = []
+
+            def _record_run_prompt(chat_id: str, actor_id: str, text: str) -> None:
+                captured.append((chat_id, actor_id, text))
+
+            service._run_prompt = _record_run_prompt
+
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "把这个文件夹压缩成压缩包然后发给我")
+
+            self.assertEqual(captured, [("chat-1", "user-1", "把这个文件夹压缩成压缩包然后发给我")])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(api.sent_files, [])
+            self.assertEqual(api.sent_messages, [])
+            self.assertEqual(codex.calls, [])
+
+    def test_send_intent_phrase_with_zip_noun_still_uses_recent_attachment_shortcut(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            zip_path = root / "attachments" / "毕设-clean.zip"
+            zip_path.parent.mkdir(parents=True, exist_ok=True)
+            zip_path.write_bytes(b"zip-bytes")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(zip_path), "kind": "file", "name": "毕设-clean.zip"}],
+            )
+
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "把压缩包发给我")
+
+            self.assertEqual(api.sent_files, [("chat-1", str(zip_path))])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(api.sent_messages, [])
+            self.assertEqual(codex.calls, [])
+
     def test_send_intent_permission_error_returns_helpful_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -900,6 +1031,57 @@ class FeishuModelAccountTests(unittest.TestCase):
                         self.assertIn("飞书服务缺少系统权限", text)
                         self.assertIn("系统设置", text)
                         self.assertNotIn(str(image_path), text)
+
+    def test_send_intent_surfaces_api_attachment_error_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            file_path = root / "archive.zip"
+            file_path.write_text("hello", encoding="utf-8")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(file_path), "kind": "file", "name": "archive.zip"}],
+            )
+
+            def _send_file_path(_chat_id, _path):
+                api.last_attachment_error = "飞书单个文件上限约 30MB，archive.zip 超出了限制。"
+                return False
+
+            api.send_file_path = _send_file_path
+
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "把压缩包发给我")
+
+            self.assertEqual(codex.calls, [])
+            self.assertEqual(api.sent_files, [])
+            text = api.sent_messages[-1][1]
+            self.assertIn("30MB", text)
+            self.assertIn("archive.zip", text)
+
+    def test_send_intent_unexpected_attachment_error_returns_helpful_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            file_path = root / "archive.zip"
+            file_path.write_text("hello", encoding="utf-8")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(file_path), "kind": "file", "name": "archive.zip"}],
+            )
+
+            def _raise_unexpected_error(_chat_id, _path):
+                raise json.JSONDecodeError("Expecting value", "", 0)
+
+            api.send_file_path = _raise_unexpected_error
+
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "把压缩包发给我")
+
+            self.assertEqual(codex.calls, [])
+            self.assertEqual(api.sent_files, [])
+            text = api.sent_messages[-1][1]
+            self.assertIn("附件发送失败", text)
+            self.assertNotIn(str(file_path), text)
 
     def test_send_intent_with_multiple_candidates_prompts_for_number(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

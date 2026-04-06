@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import errno
@@ -27,8 +28,10 @@ from codex_common import (
     extract_attachment_name_hints,
     extract_local_attachment_candidates,
     fetch_provider_account_info,
+    group_sessions_by_workspace,
     is_attachment_send_intent,
     is_allowed_home_attachment_path,
+    is_compound_attachment_send_intent,
     list_provider_models,
     load_codex_default_model,
     log,
@@ -39,6 +42,8 @@ from codex_common import (
 
 
 MAX_FEISHU_TEXT = 2000
+FEISHU_MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
+FEISHU_FILE_PART_SIZE_BYTES = 29 * 1024 * 1024
 
 
 def _is_permission_shaped_os_error(exc: OSError) -> bool:
@@ -57,6 +62,19 @@ def _is_permission_shaped_os_error(exc: OSError) -> bool:
             "access denied",
         )
     )
+
+
+def _format_file_size_mb(size_bytes: int) -> str:
+    if size_bytes <= 0:
+        return "0MB"
+    value = size_bytes / (1024 * 1024)
+    if value >= 10:
+        return f"{value:.1f}MB"
+    return f"{value:.2f}MB"
+
+
+def _part_suffix_width(total_parts: int) -> int:
+    return max(2, len(str(max(1, total_parts))))
 
 
 def parse_allowed_open_ids(raw: Optional[str]) -> Optional[Set[str]]:
@@ -300,6 +318,18 @@ class FeishuAPI:
         )
         self.level = level
         self.rich_message_enabled = rich_message_enabled
+        self._last_attachment_error: Optional[str] = None
+
+    def _clear_last_attachment_error(self) -> None:
+        self._last_attachment_error = None
+
+    def _set_last_attachment_error(self, message: str) -> None:
+        self._last_attachment_error = (message or "").strip() or None
+
+    def consume_last_attachment_error(self) -> Optional[str]:
+        message = getattr(self, "_last_attachment_error", None)
+        self._last_attachment_error = None
+        return message
 
     def send_message(self, chat_id: str, text: str) -> bool:
         ok = True
@@ -363,6 +393,7 @@ class FeishuAPI:
         return ok
 
     def send_image_path(self, chat_id: str, path: Path) -> bool:
+        self._clear_last_attachment_error()
         file_path = path.expanduser()
         if not file_path.exists() or not file_path.is_file():
             log(f"image send skipped: invalid path {file_path}")
@@ -378,7 +409,14 @@ class FeishuAPI:
                 )
                 .build()
             )
-            upload_response = self.client.im.v1.image.create(upload_request)
+            try:
+                upload_response = self.client.im.v1.image.create(upload_request)
+            except Exception as exc:
+                log(f"image upload raised unexpected error: path={file_path} error={type(exc).__name__}: {exc}")
+                self._set_last_attachment_error(
+                    "图片发送失败了，飞书接口返回异常。请稍后重试，或让我重新生成后再发送。"
+                )
+                return False
         if not upload_response.success():
             log(
                 "image upload failed: "
@@ -399,10 +437,17 @@ class FeishuAPI:
         )
 
     def send_file_path(self, chat_id: str, path: Path) -> bool:
+        self._clear_last_attachment_error()
         file_path = path.expanduser()
         if not file_path.exists() or not file_path.is_file():
             log(f"file send skipped: invalid path {file_path}")
             return False
+        file_size_bytes = file_path.stat().st_size
+        if file_size_bytes > FEISHU_MAX_FILE_SIZE_BYTES:
+            return self._send_large_file_in_parts(chat_id, file_path, file_size_bytes)
+        return self._send_uploaded_file(chat_id, file_path)
+
+    def _send_uploaded_file(self, chat_id: str, file_path: Path) -> bool:
         with file_path.open("rb") as f:
             upload_request = (
                 lark.im.v1.CreateFileRequest.builder()
@@ -415,7 +460,14 @@ class FeishuAPI:
                 )
                 .build()
             )
-            upload_response = self.client.im.v1.file.create(upload_request)
+            try:
+                upload_response = self.client.im.v1.file.create(upload_request)
+            except Exception as exc:
+                log(f"file upload raised unexpected error: path={file_path} error={type(exc).__name__}: {exc}")
+                self._set_last_attachment_error(
+                    "文件发送失败了，飞书接口返回异常。请稍后重试；如果文件较大，也可以让我重新压缩或拆分后再发。"
+                )
+                return False
         if not upload_response.success():
             log(
                 "file upload failed: "
@@ -434,6 +486,64 @@ class FeishuAPI:
             key_name="file_key",
             key_value=file_key,
         )
+
+    def _send_large_file_in_parts(self, chat_id: str, file_path: Path, file_size_bytes: int) -> bool:
+        size_text = _format_file_size_mb(file_size_bytes)
+        total_parts = max(1, (file_size_bytes + FEISHU_FILE_PART_SIZE_BYTES - 1) // FEISHU_FILE_PART_SIZE_BYTES)
+        width = _part_suffix_width(total_parts)
+        log(
+            "file exceeds Feishu upload limit, splitting into parts "
+            f"path={file_path} size_bytes={file_size_bytes} total_parts={total_parts}"
+        )
+        try:
+            with tempfile.TemporaryDirectory(prefix="feishu-file-parts-") as tmpdir:
+                with file_path.open("rb") as src:
+                    for idx in range(total_parts):
+                        remaining = min(
+                            FEISHU_FILE_PART_SIZE_BYTES,
+                            file_size_bytes - idx * FEISHU_FILE_PART_SIZE_BYTES,
+                        )
+                        part_name = f"{file_path.name}.part{idx + 1:0{width}d}"
+                        part_path = Path(tmpdir) / part_name
+                        with part_path.open("wb") as dst:
+                            bytes_left = remaining
+                            while bytes_left > 0:
+                                chunk = src.read(min(1024 * 1024, bytes_left))
+                                if not chunk:
+                                    break
+                                dst.write(chunk)
+                                bytes_left -= len(chunk)
+                        if bytes_left != 0:
+                            raise OSError(
+                                f"unexpected EOF while splitting file, part={idx + 1}, remaining={bytes_left}"
+                            )
+                        if not self._send_uploaded_file(chat_id, part_path):
+                            existing_error = self.consume_last_attachment_error()
+                            detail = (
+                                f"{file_path.name} 自动分片发送失败，卡在第 {idx + 1}/{total_parts} 片。"
+                            )
+                            if existing_error:
+                                detail = f"{detail}\n{existing_error}"
+                            self._set_last_attachment_error(detail)
+                            return False
+                notice = "\n".join(
+                    [
+                        f"{file_path.name} 超过飞书单文件上限，已自动拆成 {total_parts} 片发送。",
+                        f"原文件大小约 {size_text}。",
+                        "合并命令：",
+                        f"cat {file_path.name}.part* > {file_path.name}",
+                    ]
+                )
+                self.send_message(chat_id, notice)
+                self._clear_last_attachment_error()
+                return True
+        except Exception as exc:
+            log(f"file split failed: path={file_path} error={type(exc).__name__}: {exc}")
+            self._set_last_attachment_error(
+                f"{file_path.name} 自动分片发送失败了。\n"
+                "请稍后重试，或让我重新压缩后再发送。"
+            )
+            return False
 
     def _send_text(self, receive_id_type: str, receive_id: str, text: str) -> bool:
         request = (
@@ -478,7 +588,19 @@ class FeishuAPI:
             )
             .build()
         )
-        response = self.client.im.v1.message.create(request)
+        try:
+            response = self.client.im.v1.message.create(request)
+        except Exception as exc:
+            log(
+                "send failed with exception: "
+                f"receive_id_type={receive_id_type} msg_type={msg_type} "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            if msg_type == "image":
+                self._set_last_attachment_error("图片发送失败了，飞书接口返回异常。请稍后重试。")
+            else:
+                self._set_last_attachment_error("文件发送失败了，飞书接口返回异常。请稍后重试。")
+            return False
         if response.success():
             return True
         log(
@@ -778,17 +900,22 @@ class FeishuCodexService:
     def _handle_text(self, chat_id: str, actor_id: str, text: str) -> None:
         attachment_state_key = self._attachment_state_key(chat_id, actor_id)
         if not text.startswith("/"):
-            if self._try_handle_attachment_send_intent(chat_id, actor_id, text):
+            if (
+                not is_compound_attachment_send_intent(text)
+                and self._try_handle_attachment_send_intent(chat_id, actor_id, text)
+            ):
                 return
             if self._try_handle_attachment_pick(chat_id, actor_id, text):
                 return
             if self._try_handle_quick_model_pick(chat_id, actor_id, text):
                 return
+            if self._try_handle_quick_workspace_pick(chat_id, actor_id, text):
+                return
             if self._try_handle_quick_session_pick(chat_id, actor_id, text):
                 return
             self.state.clear_attachment_picker(attachment_state_key)
             self.state.clear_model_picker(actor_id)
-            self.state.set_pending_session_pick(actor_id, False)
+            self._clear_session_pickers(actor_id)
             self._run_prompt(chat_id, actor_id, text)
             return
 
@@ -796,6 +923,8 @@ class FeishuCodexService:
         self.state.clear_attachment_picker(attachment_state_key)
         if cmd != "model":
             self.state.clear_model_picker(actor_id)
+        if cmd != "sessions":
+            self._clear_session_pickers(actor_id)
         if cmd in ("start", "help"):
             self._send_help(chat_id)
             return
@@ -839,7 +968,7 @@ class FeishuCodexService:
             "\n".join(
                 [
                     "可用命令:",
-                    "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
+                    "/sessions [N] - 先选工作区，再选最近会话",
                     "/use <编号|session_id> - 切换当前会话",
                     "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
@@ -847,13 +976,17 @@ class FeishuCodexService:
                     "/ask <内容> - 手动提问（可选）",
                     "/model - 查看并切换可用模型",
                     "/account - 查看今日额度与剩余额度",
-                    "执行 /sessions 后，可直接发送编号切换会话",
+                    "执行 /sessions 后，先发工作区编号，再发会话编号",
                     "执行 /model 后，可直接发送编号切换模型",
                     "后台执行时仍可发送 /use /sessions /status",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                 ]
             ),
         )
+
+    def _clear_session_pickers(self, actor_id: str) -> None:
+        self.state.clear_workspace_picker(actor_id)
+        self.state.set_pending_session_pick(actor_id, False)
 
     def _handle_sessions(self, chat_id: str, actor_id: str, arg: str) -> None:
         limit = 10
@@ -867,15 +1000,45 @@ class FeishuCodexService:
         if not items:
             self.api.send_message(chat_id, "未找到本地会话记录。")
             return
-        lines = ["最近会话（用 /use 编号 切换）:"]
-        session_ids = [s.session_id for s in items]
-        for i, s in enumerate(items, start=1):
-            short_id = s.session_id[:8]
-            cwd_name = Path(s.cwd).name or s.cwd
-            lines.append(f"{i}. {s.title} | {short_id} | {cwd_name}")
-        lines.append("直接发送编号即可切换（例如发送: 1）")
+        workspaces = group_sessions_by_workspace(items)
+        lines = ["最近工作区（先选工作区，再选会话）:"]
+        for idx, workspace in enumerate(workspaces, start=1):
+            count = len(workspace["session_ids"])
+            lines.append(f"{idx}. {workspace['label']} | {count} 条会话")
+        lines.append("先发送工作区编号（例如发送: 1）")
         self.api.send_message(chat_id, "\n".join(lines))
-        self.state.set_last_session_ids(actor_id, session_ids)
+        self.state.set_last_session_ids(actor_id, [])
+        self._clear_session_pickers(actor_id)
+        self.state.set_workspace_picker(actor_id, workspaces)
+
+    def _show_workspace_sessions(self, chat_id: str, actor_id: str, workspace: Dict[str, Any]) -> None:
+        session_ids = workspace.get("session_ids")
+        if not isinstance(session_ids, list):
+            self.state.set_last_session_ids(actor_id, [])
+            self.state.set_pending_session_pick(actor_id, False)
+            self.api.send_message(chat_id, "工作区列表已失效，请重新发送 /sessions。")
+            return
+        label = str(workspace.get("label") or "当前工作区")
+        lines = [f"最近会话（工作区: {label}）:"]
+        available_session_ids: List[str] = []
+        for raw_session_id in session_ids:
+            session_id = str(raw_session_id or "").strip()
+            if not session_id:
+                continue
+            meta = self.sessions.find_by_id(session_id)
+            if not meta:
+                continue
+            available_session_ids.append(meta.session_id)
+            short_id = meta.session_id[:8]
+            lines.append(f"{len(available_session_ids)}. {meta.title} | {short_id}")
+        if not available_session_ids:
+            self.state.set_last_session_ids(actor_id, [])
+            self.state.set_pending_session_pick(actor_id, False)
+            self.api.send_message(chat_id, "该工作区下没有可用会话了，请重新发送 /sessions。")
+            return
+        lines.append("再发送会话编号即可切换（例如发送: 1）")
+        self.api.send_message(chat_id, "\n".join(lines))
+        self.state.set_last_session_ids(actor_id, available_session_ids)
         self.state.set_pending_session_pick(actor_id, True)
 
     def _handle_use(self, chat_id: str, actor_id: str, arg: str) -> None:
@@ -898,11 +1061,27 @@ class FeishuCodexService:
             self.api.send_message(chat_id, f"未找到 session: {session_id}")
             return
         self.state.set_active_session(actor_id, meta.session_id, meta.cwd)
-        self.state.set_pending_session_pick(actor_id, False)
+        self._clear_session_pickers(actor_id)
         self.api.send_message(
             chat_id,
             f"已切换到:\n{meta.title}\nsession: {meta.session_id}\ncwd: {meta.cwd}\n现在可直接发消息对话。",
         )
+
+    def _try_handle_quick_workspace_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
+        if not self.state.is_pending_workspace_pick(actor_id):
+            return False
+        raw = text.strip()
+        if not raw.isdigit():
+            return False
+        idx = int(raw)
+        picker = self.state.get_workspace_picker(actor_id)
+        workspaces = picker.get("workspaces")
+        if not isinstance(workspaces, list) or idx <= 0 or idx > len(workspaces):
+            self.api.send_message(chat_id, "工作区编号无效。请发送 /sessions 重新查看列表。")
+            return True
+        self.state.clear_workspace_picker(actor_id)
+        self._show_workspace_sessions(chat_id, actor_id, workspaces[idx - 1])
+        return True
 
     def _try_handle_quick_session_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
         if not self.state.is_pending_session_pick(actor_id):
@@ -933,7 +1112,7 @@ class FeishuCodexService:
             lines.append(f"{idx}. {model}{marker}")
         self.api.send_message(chat_id, "\n".join(lines))
         self.state.clear_model_picker(actor_id)
-        self.state.set_pending_session_pick(actor_id, False)
+        self._clear_session_pickers(actor_id)
         self.state.set_model_picker(actor_id, models)
 
     def _try_handle_quick_model_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
@@ -1077,7 +1256,7 @@ class FeishuCodexService:
                 return
             target_cwd = candidate
         self.state.clear_active_session(actor_id, str(target_cwd))
-        self.state.set_pending_session_pick(actor_id, False)
+        self._clear_session_pickers(actor_id)
         self.api.send_message(
             chat_id,
             f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",
@@ -1232,9 +1411,28 @@ class FeishuCodexService:
                 f"附件读取失败：{name}\n"
                 "请检查文件是否仍可访问，或让我重新生成到可访问目录后再发送。",
             )
+        except Exception as exc:
+            log(f"attachment send raised unexpected error: path={path} error={type(exc).__name__}: {exc}")
+            api_error_message = self._consume_api_attachment_error_message()
+            return (False, api_error_message or "附件发送失败了，请稍后再试。")
         if not ok:
-            return False, "附件发送失败了，请稍后再试。"
+            api_error_message = self._consume_api_attachment_error_message()
+            return False, api_error_message or "附件发送失败了，请稍后再试。"
         return True, None
+
+    def _consume_api_attachment_error_message(self) -> Optional[str]:
+        consumer = getattr(self.api, "consume_last_attachment_error", None)
+        if not callable(consumer):
+            return None
+        try:
+            message = consumer()
+        except Exception as exc:
+            log(f"attachment error consume failed: error={type(exc).__name__}: {exc}")
+            return None
+        if not message:
+            return None
+        text = str(message).strip()
+        return text or None
 
     def _try_handle_attachment_send_intent(self, chat_id: str, actor_id: str, text: str) -> bool:
         state_key = self._attachment_state_key(chat_id, actor_id)
@@ -1264,7 +1462,7 @@ class FeishuCodexService:
                 kind_label = "图片" if candidate["kind"] == "image" else "文件"
                 lines.append(f"{idx}. {candidate['name']} ({kind_label})")
             self.state.clear_model_picker(actor_id)
-            self.state.set_pending_session_pick(actor_id, False)
+            self._clear_session_pickers(actor_id)
             self.state.set_attachment_picker(state_key, candidates)
             self.api.send_message(chat_id, "\n".join(lines))
             return True

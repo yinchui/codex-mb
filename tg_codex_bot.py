@@ -26,6 +26,7 @@ from codex_common import (
     chunk_text,
     env,
     fetch_provider_account_info,
+    group_sessions_by_workspace,
     list_provider_models,
     log,
     load_codex_default_model,
@@ -590,10 +591,12 @@ class TgCodexService:
         if not text.startswith("/"):
             if self._try_handle_quick_model_pick(chat_id, message_id, int(user_id), text):
                 return
+            if self._try_handle_quick_workspace_pick(chat_id, message_id, int(user_id), text):
+                return
             if self._try_handle_quick_session_pick(chat_id, message_id, int(user_id), text):
                 return
             self.state.clear_model_picker(int(user_id))
-            self.state.set_pending_session_pick(int(user_id), False)
+            self._clear_session_pickers(int(user_id))
             self._handle_chat_message(chat_id, message_id, int(user_id), text)
             return
 
@@ -601,6 +604,8 @@ class TgCodexService:
         log(f"command: /{cmd} arg={arg[:80]!r}")
         if cmd != "model":
             self.state.clear_model_picker(int(user_id))
+        if cmd != "sessions":
+            self._clear_session_pickers(int(user_id))
         if cmd in ("start", "help"):
             self._send_help(chat_id, message_id)
             return
@@ -650,6 +655,12 @@ class TgCodexService:
             self.api.answer_callback_query(cq_id, text="无法解析聊天上下文。", show_alert=True)
             return
 
+        if data.startswith("workspace:"):
+            raw_index = data[10:]
+            self.api.answer_callback_query(cq_id, text="正在打开工作区...")
+            self._handle_workspace_callback(chat_id, reply_to, int(user_id), raw_index)
+            return
+
         if data.startswith("use:"):
             session_id = data[4:]
             self.api.answer_callback_query(cq_id, text="正在切换会话...")
@@ -674,15 +685,15 @@ class TgCodexService:
                     "可用命令:",
                     "/model - 查看可切换模型，并用编号切换",
                     "/account - 查看今天剩余 API 额度",
-                    "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
+                    "/sessions [N] - 先选工作区，再选最近会话",
                     "/use <编号|session_id> - 切换当前会话",
                     "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
                     "/status - 查看当前绑定会话",
                     "/ask <内容> - 手动提问（可选）",
                     "执行 /model 后，可直接发送编号切换模型",
-                    "执行 /sessions 后，可直接发送编号切换会话",
-                    "执行 /sessions 后，也可点击按钮直接切换会话",
+                    "执行 /sessions 后，先选工作区，再选会话",
+                    "执行 /sessions 后，也可点击按钮逐级切换",
                     "后台执行时仍可发送 /use /sessions /status",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                     "已配置转写时，也可直接发送 Telegram 语音或音频消息",
@@ -690,6 +701,10 @@ class TgCodexService:
             ),
             reply_to=reply_to,
         )
+
+    def _clear_session_pickers(self, user_id: int) -> None:
+        self.state.clear_workspace_picker(user_id)
+        self.state.set_pending_session_pick(user_id, False)
 
     def _handle_sessions(self, chat_id: int, reply_to: int, arg: str, user_id: int) -> None:
         limit = 10
@@ -703,30 +718,91 @@ class TgCodexService:
         if not items:
             self.api.send_message(chat_id, "未找到本地会话记录。", reply_to=reply_to)
             return
-        lines = ["最近会话（用 /use 编号 切换）:"]
-        session_ids = [s.session_id for s in items]
+        workspaces = group_sessions_by_workspace(items)
+        lines = ["最近工作区（先选工作区，再选会话）:"]
         keyboard_rows: List[List[Dict[str, str]]] = []
-        for i, s in enumerate(items, start=1):
-            short_id = s.session_id[:8]
-            cwd_name = Path(s.cwd).name or s.cwd
-            lines.append(f"{i}. {s.title} | {short_id} | {cwd_name}")
+        for i, workspace in enumerate(workspaces, start=1):
+            count = len(workspace["session_ids"])
+            lines.append(f"{i}. {workspace['label']} | {count} 条会话")
             keyboard_rows.append(
                 [
                     {
-                        "text": f"切换 {i}",
-                        "callback_data": f"use:{s.session_id}",
+                        "text": f"工作区 {i}",
+                        "callback_data": f"workspace:{i}",
                     }
                 ]
             )
-        lines.append("直接发送编号即可切换（例如发送: 1）")
+        lines.append("先发送工作区编号（例如发送: 1）")
         self.api.send_message(
             chat_id,
             "\n".join(lines),
             reply_to=reply_to,
             reply_markup={"inline_keyboard": keyboard_rows},
         )
-        self.state.set_last_session_ids(user_id, session_ids)
+        self.state.set_last_session_ids(user_id, [])
+        self._clear_session_pickers(user_id)
+        self.state.set_workspace_picker(user_id, workspaces)
+
+    def _show_workspace_sessions(self, chat_id: int, reply_to: int, user_id: int, workspace: Dict[str, Any]) -> None:
+        session_ids = workspace.get("session_ids")
+        if not isinstance(session_ids, list):
+            self.state.set_last_session_ids(user_id, [])
+            self.state.set_pending_session_pick(user_id, False)
+            self.api.send_message(chat_id, "工作区列表已失效，请重新发送 /sessions。", reply_to=reply_to)
+            return
+        label = str(workspace.get("label") or "当前工作区")
+        lines = [f"最近会话（工作区: {label}）:"]
+        available_session_ids: List[str] = []
+        keyboard_rows: List[List[Dict[str, str]]] = []
+        for raw_session_id in session_ids:
+            session_id = str(raw_session_id or "").strip()
+            if not session_id:
+                continue
+            meta = self.sessions.find_by_id(session_id)
+            if not meta:
+                continue
+            available_session_ids.append(meta.session_id)
+            short_id = meta.session_id[:8]
+            index = len(available_session_ids)
+            lines.append(f"{index}. {meta.title} | {short_id}")
+            keyboard_rows.append(
+                [
+                    {
+                        "text": f"会话 {index}",
+                        "callback_data": f"use:{meta.session_id}",
+                    }
+                ]
+            )
+        if not available_session_ids:
+            self.state.set_last_session_ids(user_id, [])
+            self.state.set_pending_session_pick(user_id, False)
+            self.api.send_message(chat_id, "该工作区下没有可用会话了，请重新发送 /sessions。", reply_to=reply_to)
+            return
+        lines.append("再发送会话编号即可切换（例如发送: 1）")
+        self.api.send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_to=reply_to,
+            reply_markup={"inline_keyboard": keyboard_rows},
+        )
+        self.state.set_last_session_ids(user_id, available_session_ids)
         self.state.set_pending_session_pick(user_id, True)
+
+    def _handle_workspace_callback(self, chat_id: int, reply_to: int, user_id: int, raw_index: str) -> None:
+        if not raw_index.isdigit():
+            self.api.send_message(chat_id, "工作区编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
+            return
+        self._open_workspace_sessions(chat_id, reply_to, user_id, int(raw_index))
+
+    def _open_workspace_sessions(self, chat_id: int, reply_to: int, user_id: int, idx: int) -> bool:
+        picker = self.state.get_workspace_picker(user_id)
+        workspaces = picker.get("workspaces")
+        if not isinstance(workspaces, list) or idx <= 0 or idx > len(workspaces):
+            self.api.send_message(chat_id, "工作区编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
+            return False
+        self.state.clear_workspace_picker(user_id)
+        self._show_workspace_sessions(chat_id, reply_to, user_id, workspaces[idx - 1])
+        return True
 
     def _handle_use(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
         selector = arg.strip()
@@ -748,12 +824,20 @@ class TgCodexService:
             self.api.send_message(chat_id, f"未找到 session: {session_id}", reply_to=reply_to)
             return
         self.state.set_active_session(user_id, meta.session_id, meta.cwd)
-        self.state.set_pending_session_pick(user_id, False)
+        self._clear_session_pickers(user_id)
         self.api.send_message(
             chat_id,
             f"已切换到:\n{meta.title}\nsession: {meta.session_id}\ncwd: {meta.cwd}\n现在可直接发消息对话。",
             reply_to=reply_to,
         )
+
+    def _try_handle_quick_workspace_pick(self, chat_id: int, reply_to: int, user_id: int, text: str) -> bool:
+        if not self.state.is_pending_workspace_pick(user_id):
+            return False
+        raw = text.strip()
+        if not raw.isdigit():
+            return False
+        return self._open_workspace_sessions(chat_id, reply_to, user_id, int(raw))
 
     def _try_handle_quick_session_pick(self, chat_id: int, reply_to: int, user_id: int, text: str) -> bool:
         if not self.state.is_pending_session_pick(user_id):
@@ -788,7 +872,7 @@ class TgCodexService:
             lines.append(f"{idx}. {model}{marker}")
         self.api.send_message(chat_id, "\n".join(lines), reply_to=reply_to)
         self.state.clear_model_picker(user_id)
-        self.state.set_pending_session_pick(user_id, False)
+        self._clear_session_pickers(user_id)
         self.state.set_model_picker(user_id, models)
 
     def _try_handle_quick_model_pick(self, chat_id: int, reply_to: int, user_id: int, text: str) -> bool:
@@ -939,7 +1023,7 @@ class TgCodexService:
                 return
             target_cwd = candidate
         self.state.clear_active_session(user_id, str(target_cwd))
-        self.state.set_pending_session_pick(user_id, False)
+        self._clear_session_pickers(user_id)
         self.api.send_message(
             chat_id,
             f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",

@@ -135,6 +135,27 @@ class TelegramModelAccountTests(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def make_callback_update(
+        data: str,
+        user_id: int = 42,
+        chat_id: int = 100,
+        message_id: int = 900,
+        callback_id: str = "cb-1",
+    ):
+        return {
+            "update_id": message_id,
+            "callback_query": {
+                "id": callback_id,
+                "from": {"id": user_id},
+                "data": data,
+                "message": {
+                    "message_id": message_id,
+                    "chat": {"id": chat_id},
+                },
+            },
+        }
+
     def test_bot_commands_include_model_and_account(self) -> None:
         commands = {item["command"] for item in BOT_COMMANDS}
         self.assertIn("model", commands)
@@ -182,7 +203,7 @@ class TelegramModelAccountTests(unittest.TestCase):
     def test_sessions_command_clears_pending_model_picker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            service, _, state, _ = self.build_service(root)
+            service, api, state, _ = self.build_service(root)
 
             with patch(
                 "tg_codex_bot.list_provider_models",
@@ -194,10 +215,50 @@ class TelegramModelAccountTests(unittest.TestCase):
                 service._handle_update(self.make_text_update("/model"))
 
             service._handle_update(self.make_text_update("/sessions", message_id=2))
+            self.assertTrue(state.is_pending_workspace_pick(42))
+            self.assertFalse(state.is_pending_session_pick(42))
+            self.assertIn("最近工作区", api.sent_messages[-1]["text"])
+
             service._handle_update(self.make_text_update("1", message_id=3))
+
+            self.assertFalse(state.is_pending_workspace_pick(42))
+            self.assertTrue(state.is_pending_session_pick(42))
+            self.assertIsNone(state.get_active(42)[0])
+            self.assertIn("最近会话", api.sent_messages[-1]["text"])
+
+            service._handle_update(self.make_text_update("1", message_id=4))
 
             self.assertEqual(state.get_active(42)[0], "sess-1")
             self.assertIsNone(state.get_selected_model(42))
+
+    def test_workspace_callback_shows_second_level_sessions_before_switching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, _ = self.build_service(root)
+
+            service._handle_update(self.make_text_update("/sessions"))
+
+            first_message = api.sent_messages[-1]
+            self.assertEqual(
+                first_message["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+                "workspace:1",
+            )
+
+            service._handle_update(self.make_callback_update("workspace:1"))
+
+            second_message = api.sent_messages[-1]
+            self.assertFalse(state.is_pending_workspace_pick(42))
+            self.assertTrue(state.is_pending_session_pick(42))
+            self.assertIsNone(state.get_active(42)[0])
+            self.assertIn("最近会话", second_message["text"])
+            self.assertEqual(
+                second_message["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+                "use:sess-1",
+            )
+
+            service._handle_update(self.make_callback_update("use:sess-1", message_id=901, callback_id="cb-2"))
+
+            self.assertEqual(state.get_active(42)[0], "sess-1")
 
     def test_account_command_formats_quota_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
