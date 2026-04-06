@@ -6,6 +6,9 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
@@ -86,6 +89,10 @@ class SessionMeta:
 
 
 StateActor = Union[int, str]
+
+
+class ProviderLookupError(RuntimeError):
+    pass
 
 
 class SessionStore:
@@ -753,3 +760,161 @@ def resolve_codex_bin(configured: Optional[str]) -> str:
     if Path(app_path).exists():
         return app_path
     return "codex"
+
+
+def resolve_codex_config_path() -> Path:
+    return Path("~/.codex/config.toml").expanduser()
+
+
+def resolve_codex_auth_path() -> Path:
+    return Path("~/.codex/auth.json").expanduser()
+
+
+def _parse_toml_string(raw: str) -> str:
+    value = (raw or "").strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return bytes(value[1:-1], "utf-8").decode("unicode_escape")
+    return value
+
+
+def load_codex_base_url(config_path: Optional[Path] = None) -> Optional[str]:
+    target = (config_path or resolve_codex_config_path()).expanduser()
+    if not target.exists():
+        return None
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+
+    active_provider: Optional[str] = None
+    current_section: Optional[str] = None
+    provider_base_urls: Dict[str, str] = {}
+
+    for raw_line in lines:
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line[1:-1].strip()
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not current_section and key == "model_provider":
+            active_provider = _parse_toml_string(value)
+            continue
+        if not current_section or not current_section.startswith("model_providers."):
+            continue
+        provider_name = current_section.split(".", 1)[1].strip()
+        if key == "base_url":
+            provider_base_urls[provider_name] = _parse_toml_string(value).rstrip("/")
+
+    if not active_provider:
+        return None
+    return provider_base_urls.get(active_provider)
+
+
+def load_codex_api_key(auth_path: Optional[Path] = None) -> Optional[str]:
+    target = (auth_path or resolve_codex_auth_path()).expanduser()
+    if not target.exists():
+        return None
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    api_key = str(payload.get("OPENAI_API_KEY") or "").strip()
+    return api_key or None
+
+
+def _resolve_provider_origin(base_url: str) -> str:
+    parsed = urllib.parse.urlsplit((base_url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        raise ProviderLookupError("本地 Codex provider base_url 无效。")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _provider_json_get(url: str, api_key: str) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        url=url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "ignore")
+        except Exception:
+            body = ""
+        raise ProviderLookupError(
+            f"provider 请求失败: HTTP {e.code}" + (f" {body[:200]}" if body else "")
+        ) from e
+    except urllib.error.URLError as e:
+        raise ProviderLookupError(f"provider 网络请求失败: {e}") from e
+    except json.JSONDecodeError as e:
+        raise ProviderLookupError("provider 返回的不是有效 JSON。") from e
+    if not isinstance(payload, dict):
+        raise ProviderLookupError("provider 返回了意外数据。")
+    return payload
+
+
+def list_provider_models(
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    config_path: Optional[Path] = None,
+    auth_path: Optional[Path] = None,
+) -> List[str]:
+    resolved_base_url = (base_url or load_codex_base_url(config_path=config_path) or "").strip().rstrip("/")
+    if not resolved_base_url:
+        raise ProviderLookupError("未找到本地 Codex provider base_url。")
+    resolved_api_key = (api_key or load_codex_api_key(auth_path=auth_path) or "").strip()
+    if not resolved_api_key:
+        raise ProviderLookupError("未找到本地 Codex API key。")
+
+    payload = _provider_json_get(f"{resolved_base_url}/v1/models", resolved_api_key)
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise ProviderLookupError("provider 模型列表格式不正确。")
+
+    models: List[str] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if model_id:
+            models.append(model_id)
+    if not models:
+        raise ProviderLookupError("provider 没有返回可用模型。")
+    return models
+
+
+def fetch_provider_account_info(
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    config_path: Optional[Path] = None,
+    auth_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    resolved_base_url = (base_url or load_codex_base_url(config_path=config_path) or "").strip().rstrip("/")
+    if not resolved_base_url:
+        raise ProviderLookupError("未找到本地 Codex provider base_url。")
+    resolved_api_key = (api_key or load_codex_api_key(auth_path=auth_path) or "").strip()
+    if not resolved_api_key:
+        raise ProviderLookupError("未找到本地 Codex API key。")
+
+    origin = _resolve_provider_origin(resolved_base_url)
+    payload = _provider_json_get(f"{origin}/user/api/v1/me", resolved_api_key)
+    quota = payload.get("quota")
+    usage = payload.get("usage")
+    if not isinstance(quota, dict) or not isinstance(usage, dict):
+        raise ProviderLookupError("provider 账户额度格式不正确。")
+    return payload
