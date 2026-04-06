@@ -25,7 +25,10 @@ from codex_common import (
     SessionStore,
     chunk_text,
     env,
+    fetch_provider_account_info,
+    list_provider_models,
     log,
+    load_codex_default_model,
     parse_bool_env,
     parse_dangerous_bypass_level,
     parse_non_negative_int,
@@ -37,6 +40,8 @@ MAX_TELEGRAM_TEXT = 4096
 BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "start", "description": "开始使用"},
     {"command": "help", "description": "查看帮助"},
+    {"command": "model", "description": "切换模型"},
+    {"command": "account", "description": "查看额度"},
     {"command": "sessions", "description": "查看最近会话"},
     {"command": "use", "description": "切换会话"},
     {"command": "history", "description": "查看会话历史"},
@@ -583,16 +588,27 @@ class TgCodexService:
                 )
             return
         if not text.startswith("/"):
+            if self._try_handle_quick_model_pick(chat_id, message_id, int(user_id), text):
+                return
             if self._try_handle_quick_session_pick(chat_id, message_id, int(user_id), text):
                 return
+            self.state.clear_model_picker(int(user_id))
             self.state.set_pending_session_pick(int(user_id), False)
             self._handle_chat_message(chat_id, message_id, int(user_id), text)
             return
 
         cmd, arg = self._parse_command(text)
         log(f"command: /{cmd} arg={arg[:80]!r}")
+        if cmd != "model":
+            self.state.clear_model_picker(int(user_id))
         if cmd in ("start", "help"):
             self._send_help(chat_id, message_id)
+            return
+        if cmd == "model":
+            self._handle_model(chat_id, message_id, int(user_id), arg)
+            return
+        if cmd == "account":
+            self._handle_account(chat_id, message_id)
             return
         if cmd == "sessions":
             self._handle_sessions(chat_id, message_id, arg, int(user_id))
@@ -656,12 +672,15 @@ class TgCodexService:
             "\n".join(
                 [
                     "可用命令:",
+                    "/model - 查看可切换模型，并用编号切换",
+                    "/account - 查看今天剩余 API 额度",
                     "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
                     "/use <编号|session_id> - 切换当前会话",
                     "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
                     "/status - 查看当前绑定会话",
                     "/ask <内容> - 手动提问（可选）",
+                    "执行 /model 后，可直接发送编号切换模型",
                     "执行 /sessions 后，可直接发送编号切换会话",
                     "执行 /sessions 后，也可点击按钮直接切换会话",
                     "后台执行时仍可发送 /use /sessions /status",
@@ -753,6 +772,62 @@ class TgCodexService:
             return True
         self._switch_to_session(chat_id, reply_to, user_id, recent_ids[idx - 1])
         return True
+
+    def _handle_model(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
+        if arg.strip():
+            self.api.send_message(chat_id, "当前 /model 不需要参数，直接发送 /model 即可。", reply_to=reply_to)
+            return
+        models = list_provider_models()
+        current_model = self.state.get_selected_model(user_id) or load_codex_default_model() or models[0]
+        lines = [
+            f"当前模型: {current_model}",
+            "可切换模型（回复编号即可切换）:",
+        ]
+        for idx, model in enumerate(models, start=1):
+            marker = " (当前)" if model == current_model else ""
+            lines.append(f"{idx}. {model}{marker}")
+        self.api.send_message(chat_id, "\n".join(lines), reply_to=reply_to)
+        self.state.clear_model_picker(user_id)
+        self.state.set_pending_session_pick(user_id, False)
+        self.state.set_model_picker(user_id, models)
+
+    def _try_handle_quick_model_pick(self, chat_id: int, reply_to: int, user_id: int, text: str) -> bool:
+        if not self.state.is_pending_model_pick(user_id):
+            return False
+        raw = text.strip()
+        if not raw.isdigit():
+            return False
+        idx = int(raw)
+        picker = self.state.get_model_picker(user_id)
+        models = picker.get("models")
+        if not isinstance(models, list) or idx <= 0 or idx > len(models):
+            self.api.send_message(
+                chat_id,
+                "模型编号无效。请发送 /model 重新查看列表。",
+                reply_to=reply_to,
+            )
+            return True
+        selected_model = str(models[idx - 1])
+        self.state.set_selected_model(user_id, selected_model)
+        self.state.clear_model_picker(user_id)
+        self.api.send_message(chat_id, f"已切换模型为: {selected_model}", reply_to=reply_to)
+        return True
+
+    def _handle_account(self, chat_id: int, reply_to: int) -> None:
+        payload = fetch_provider_account_info()
+        quota = payload.get("quota") if isinstance(payload.get("quota"), dict) else {}
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        lines = [
+            "账户额度:",
+            f"服务: {payload.get('sub_service_type_name') or payload.get('service_type') or 'unknown'}",
+            f"计费方式: {payload.get('billing_type') or 'unknown'}",
+            f"今日总额度: {quota.get('daily_quota', '-')}",
+            f"今日已花: {quota.get('daily_spent', '-')}",
+            f"今日剩余: {quota.get('daily_remaining', '-')}",
+            f"今日请求数: {usage.get('daily_request_count', '-')}",
+            f"重置时间: {quota.get('next_reset_at', '-')}",
+        ]
+        self.api.send_message(chat_id, "\n".join(lines), reply_to=reply_to)
 
     def _handle_history(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
         tokens = [x for x in arg.split() if x]
@@ -1151,10 +1226,12 @@ class TgCodexService:
         typing = TypingStatus(self.api, chat_id)
         typing.start()
         try:
+            selected_model = self.state.get_selected_model(user_id)
             thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
                 prompt=prompt,
                 cwd=cwd,
                 session_id=active_id,
+                model=selected_model,
                 on_update=on_update if stream_message_id is not None else None,
             )
         except Exception as e:

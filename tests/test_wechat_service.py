@@ -370,6 +370,64 @@ class WechatServiceTests(unittest.TestCase):
             self.assertFalse(state.is_pending_model_pick("user@im.wechat"))
             self.assertIn("gpt-5.3", api.sent[-1][2])
 
+    def test_sessions_command_clears_pending_model_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sessions_root = root / "sessions"
+            write_session_file(sessions_root, "sess-1", str(root), "first prompt")
+            api = RecordingWechatAPI()
+            state = BotState(root / "state.json")
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(sessions_root),
+                state=state,
+                codex=FakeCodexRunner(),
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            with patch(
+                "wechat_codex_service.list_provider_models",
+                return_value=["gpt-5.4", "gpt-5.3"],
+            ), patch(
+                "wechat_codex_service.load_codex_default_model",
+                return_value="gpt-5.4",
+            ):
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 20,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-model",
+                        "item_list": [{"type": 1, "text_item": {"text": "/model"}}],
+                    }
+                )
+
+            service._handle_message(
+                {
+                    "message_type": 1,
+                    "message_id": 21,
+                    "from_user_id": "user@im.wechat",
+                    "context_token": "ctx-sessions",
+                    "item_list": [{"type": 1, "text_item": {"text": "/sessions"}}],
+                }
+            )
+            service._handle_message(
+                {
+                    "message_type": 1,
+                    "message_id": 22,
+                    "from_user_id": "user@im.wechat",
+                    "context_token": "ctx-pick",
+                    "item_list": [{"type": 1, "text_item": {"text": "1"}}],
+                }
+            )
+
+            self.assertEqual(state.get_active("user@im.wechat")[0], "sess-1")
+            self.assertIsNone(state.get_selected_model("user@im.wechat"))
+
     def test_account_command_formats_quota_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

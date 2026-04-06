@@ -513,6 +513,8 @@ class WechatCodexService:
             return
 
         cmd, arg = self._parse_command(text)
+        if cmd != "model":
+            self.state.clear_model_picker(from_user_id)
         if cmd in ("start", "help"):
             self._send_help(from_user_id, context_token)
             return

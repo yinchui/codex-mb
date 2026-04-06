@@ -1,12 +1,11 @@
 import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from codex_common import BotState, SessionStore
-from feishu_longconn_service import FeishuCodexService
+from tg_codex_bot import BOT_COMMANDS, TgCodexService
 
 
 def write_session_file(root: Path, session_id: str, cwd: str, title_prompt: str) -> None:
@@ -33,27 +32,45 @@ def write_session_file(root: Path, session_id: str, cwd: str, title_prompt: str)
     target.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in payloads), encoding="utf-8")
 
 
-class FakeFeishuAPI:
+class FakeTelegramAPI:
     def __init__(self) -> None:
-        self.level = "INFO"
-        self.rich_message_enabled = False
         self.sent_messages = []
+        self.chat_actions = []
 
-    def send_message(self, chat_id: str, text: str) -> bool:
-        self.sent_messages.append((chat_id, text))
-        return True
+    def send_message(self, chat_id: int, text: str, reply_to=None, reply_markup=None) -> None:
+        self.sent_messages.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "reply_to": reply_to,
+                "reply_markup": reply_markup,
+            }
+        )
 
-    def send_agent_message(self, chat_id: str, text: str, title: str = "") -> bool:
-        self.sent_messages.append((chat_id, text, title))
-        return True
+    def send_message_with_result(self, chat_id: int, text: str, reply_to=None, reply_markup=None):
+        self.send_message(chat_id, text, reply_to=reply_to, reply_markup=reply_markup)
+        return {"message_id": len(self.sent_messages)}
 
-    def send_agent_message_with_id(self, chat_id: str, text: str, title: str = ""):
-        self.sent_messages.append((chat_id, text, title))
-        return "msg-1"
+    def edit_message_text(self, chat_id: int, message_id: int, text: str) -> None:
+        self.sent_messages.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+            }
+        )
 
-    def patch_agent_message(self, message_id: str, text: str, title: str = "") -> bool:
-        self.sent_messages.append((message_id, text, title))
-        return True
+    def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        self.chat_actions.append((chat_id, action))
+
+    def answer_callback_query(self, callback_query_id: str, text=None, show_alert: bool = False) -> None:
+        return None
+
+    def set_my_commands(self, commands):
+        return None
+
+    def set_chat_menu_button_commands(self) -> None:
+        return None
 
 
 class FakeCodexRunner:
@@ -72,27 +89,7 @@ class FakeCodexRunner:
         return ("thread-123", f"answer:{prompt}", "", 0)
 
 
-class FeishuServiceHarness(FeishuCodexService):
-    def __init__(self, *args, **kwargs):
-        self.api = kwargs["api"]
-        self.sessions = kwargs["sessions"]
-        self.state = kwargs["state"]
-        self.codex = kwargs["codex"]
-        self.default_cwd = kwargs["default_cwd"]
-        self.allowed_open_ids = kwargs.get("allowed_open_ids")
-        self.enable_p2p = kwargs.get("enable_p2p", True)
-        self.ignore_old_message_seconds = kwargs.get("ignore_old_message_seconds", 0)
-        self.stream_enabled = False
-        self.stream_edit_interval_ms = 400
-        self.stream_min_delta_chars = 12
-        self.thinking_status_interval_ms = 900
-        self.running_prompts = kwargs["running_prompts"]
-        self.startup_time_ms = int(time.time() * 1000)
-        self.seen_event_ids = set()
-        self.seen_message_ids = set()
-
-
-class _RunningPromptRegistryStub:
+class TgRunningPromptRegistryStub:
     def try_start(self, actor, session_id):
         return True
 
@@ -103,25 +100,45 @@ class _RunningPromptRegistryStub:
         return 0
 
 
-class FeishuModelAccountTests(unittest.TestCase):
+class TelegramModelAccountTests(unittest.TestCase):
     def build_service(self, root: Path):
         sessions_root = root / "sessions"
         write_session_file(sessions_root, "sess-1", str(root), "first prompt")
-        api = FakeFeishuAPI()
+        api = FakeTelegramAPI()
         state = BotState(root / "state.json")
         codex = FakeCodexRunner()
-        service = FeishuServiceHarness(
+        service = TgCodexService(
             api=api,
             sessions=SessionStore(sessions_root),
             state=state,
             codex=codex,
+            audio_transcriber=None,
             default_cwd=root,
-            running_prompts=_RunningPromptRegistryStub(),
-            enable_p2p=True,
-            ignore_old_message_seconds=0,
-            allowed_open_ids=None,
+            allowed_user_ids=None,
+            stream_enabled=False,
+            stream_edit_interval_ms=400,
+            stream_min_delta_chars=12,
+            thinking_status_interval_ms=900,
         )
+        service.running_prompts = TgRunningPromptRegistryStub()
         return service, api, state, codex
+
+    @staticmethod
+    def make_text_update(text: str, user_id: int = 42, chat_id: int = 100, message_id: int = 1):
+        return {
+            "update_id": message_id,
+            "message": {
+                "message_id": message_id,
+                "chat": {"id": chat_id},
+                "from": {"id": user_id},
+                "text": text,
+            },
+        }
+
+    def test_bot_commands_include_model_and_account(self) -> None:
+        commands = {item["command"] for item in BOT_COMMANDS}
+        self.assertIn("model", commands)
+        self.assertIn("account", commands)
 
     def test_model_command_lists_provider_models(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -129,15 +146,15 @@ class FeishuModelAccountTests(unittest.TestCase):
             service, api, _, _ = self.build_service(root)
 
             with patch(
-                "feishu_longconn_service.list_provider_models",
+                "tg_codex_bot.list_provider_models",
                 return_value=["gpt-5.4", "gpt-5.3"],
             ), patch(
-                "feishu_longconn_service.load_codex_default_model",
+                "tg_codex_bot.load_codex_default_model",
                 return_value="gpt-5.4",
             ):
-                service._handle_text("chat-1", "user-1", "/model")
+                service._handle_update(self.make_text_update("/model"))
 
-            text = api.sent_messages[-1][1]
+            text = api.sent_messages[-1]["text"]
             self.assertIn("1. gpt-5.4", text)
             self.assertIn("2. gpt-5.3", text)
             self.assertIn("当前模型", text)
@@ -148,19 +165,19 @@ class FeishuModelAccountTests(unittest.TestCase):
             service, api, state, _ = self.build_service(root)
 
             with patch(
-                "feishu_longconn_service.list_provider_models",
+                "tg_codex_bot.list_provider_models",
                 return_value=["gpt-5.4", "gpt-5.3"],
             ), patch(
-                "feishu_longconn_service.load_codex_default_model",
+                "tg_codex_bot.load_codex_default_model",
                 return_value="gpt-5.4",
             ):
-                service._handle_text("chat-1", "user-1", "/model")
+                service._handle_update(self.make_text_update("/model"))
 
-            service._handle_text("chat-1", "user-1", "2")
+            service._handle_update(self.make_text_update("2", message_id=2))
 
-            self.assertEqual(state.get_selected_model("user-1"), "gpt-5.3")
-            self.assertFalse(state.is_pending_model_pick("user-1"))
-            self.assertIn("gpt-5.3", api.sent_messages[-1][1])
+            self.assertEqual(state.get_selected_model(42), "gpt-5.3")
+            self.assertFalse(state.is_pending_model_pick(42))
+            self.assertIn("gpt-5.3", api.sent_messages[-1]["text"])
 
     def test_sessions_command_clears_pending_model_picker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -168,19 +185,19 @@ class FeishuModelAccountTests(unittest.TestCase):
             service, _, state, _ = self.build_service(root)
 
             with patch(
-                "feishu_longconn_service.list_provider_models",
+                "tg_codex_bot.list_provider_models",
                 return_value=["gpt-5.4", "gpt-5.3"],
             ), patch(
-                "feishu_longconn_service.load_codex_default_model",
+                "tg_codex_bot.load_codex_default_model",
                 return_value="gpt-5.4",
             ):
-                service._handle_text("chat-1", "user-1", "/model")
+                service._handle_update(self.make_text_update("/model"))
 
-            service._handle_text("chat-1", "user-1", "/sessions")
-            service._handle_text("chat-1", "user-1", "1")
+            service._handle_update(self.make_text_update("/sessions", message_id=2))
+            service._handle_update(self.make_text_update("1", message_id=3))
 
-            self.assertEqual(state.get_active("user-1")[0], "sess-1")
-            self.assertIsNone(state.get_selected_model("user-1"))
+            self.assertEqual(state.get_active(42)[0], "sess-1")
+            self.assertIsNone(state.get_selected_model(42))
 
     def test_account_command_formats_quota_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -202,12 +219,12 @@ class FeishuModelAccountTests(unittest.TestCase):
             }
 
             with patch(
-                "feishu_longconn_service.fetch_provider_account_info",
+                "tg_codex_bot.fetch_provider_account_info",
                 return_value=payload,
             ):
-                service._handle_text("chat-1", "user-1", "/account")
+                service._handle_update(self.make_text_update("/account"))
 
-            text = api.sent_messages[-1][1]
+            text = api.sent_messages[-1]["text"]
             self.assertIn("今日剩余", text)
             self.assertIn("8760", text)
             self.assertIn("40", text)
@@ -216,11 +233,12 @@ class FeishuModelAccountTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             service, _, state, codex = self.build_service(root)
-            state.set_selected_model("user-1", "gpt-5.3")
+            state.set_selected_model(42, "gpt-5.3")
 
             service._run_prompt_worker(
-                chat_id="chat-1",
-                actor_id="user-1",
+                chat_id=100,
+                reply_to=1,
+                user_id=42,
                 prompt="hello",
                 active_id=None,
                 cwd=root,

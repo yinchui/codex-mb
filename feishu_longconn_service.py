@@ -590,6 +590,8 @@ class FeishuCodexService:
             return
 
         cmd, arg = self._parse_command(text)
+        if cmd != "model":
+            self.state.clear_model_picker(actor_id)
         if cmd in ("start", "help"):
             self._send_help(chat_id)
             return
