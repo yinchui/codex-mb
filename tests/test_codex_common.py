@@ -6,6 +6,8 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from codex_common import (
+    BotState,
+    CodexRunner,
     ProviderLookupError,
     fetch_provider_account_info,
     list_provider_models,
@@ -118,6 +120,87 @@ class ProviderApiTests(unittest.TestCase):
                     base_url="https://yunyi.rdzhvip.com/codex",
                     api_key="sk-test",
                 )
+
+
+class BotStateModelTests(unittest.TestCase):
+    def test_bot_state_persists_selected_model_per_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+
+            state.set_selected_model("user-1", "gpt-5.4")
+
+            self.assertEqual(state.get_selected_model("user-1"), "gpt-5.4")
+            self.assertIsNone(state.get_selected_model("user-2"))
+
+    def test_bot_state_tracks_pending_model_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+
+            state.set_model_picker("user-1", ["gpt-5.4", "gpt-5.3"])
+
+            self.assertTrue(state.is_pending_model_pick("user-1"))
+            self.assertEqual(state.get_model_picker("user-1")["models"], ["gpt-5.4", "gpt-5.3"])
+
+            state.clear_model_picker("user-1")
+
+            self.assertFalse(state.is_pending_model_pick("user-1"))
+            self.assertEqual(state.get_model_picker("user-1"), {})
+
+
+class _FakePipe:
+    def __iter__(self):
+        return iter(())
+
+    def close(self) -> None:
+        return None
+
+
+class _FakeProcess:
+    def __init__(self) -> None:
+        self.stdout = _FakePipe()
+        self.stderr = _FakePipe()
+        self.pid = 999
+
+    def poll(self):
+        return 0
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class CodexRunnerModelFlagTests(unittest.TestCase):
+    def test_run_prompt_includes_model_flag_for_new_session(self) -> None:
+        runner = CodexRunner(codex_bin="codex")
+
+        with patch("subprocess.Popen", return_value=_FakeProcess()) as popen:
+            runner.run_prompt(
+                prompt="hello",
+                cwd=Path("/tmp"),
+                model="gpt-5.4",
+            )
+
+        cmd = popen.call_args.kwargs if popen.call_args and popen.call_args.kwargs else {}
+        argv = popen.call_args.args[0]
+        self.assertIn("-m", argv)
+        self.assertIn("gpt-5.4", argv)
+        self.assertLess(argv.index("-m"), argv.index("hello"))
+
+    def test_run_prompt_includes_model_flag_for_resume(self) -> None:
+        runner = CodexRunner(codex_bin="codex")
+
+        with patch("subprocess.Popen", return_value=_FakeProcess()) as popen:
+            runner.run_prompt(
+                prompt="continue",
+                cwd=Path("/tmp"),
+                session_id="sess-1",
+                model="gpt-5.3",
+            )
+
+        argv = popen.call_args.args[0]
+        self.assertIn("resume", argv)
+        self.assertIn("-m", argv)
+        self.assertIn("gpt-5.3", argv)
+        self.assertLess(argv.index("-m"), argv.index("sess-1"))
 
 
 if __name__ == "__main__":

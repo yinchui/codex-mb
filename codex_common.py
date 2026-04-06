@@ -324,6 +324,18 @@ class BotState:
                 return []
             return [str(v) for v in values]
 
+    def set_selected_model(self, user_id: StateActor, model: str) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["selected_model"] = str(model).strip() or None
+            self._save_unlocked()
+
+    def get_selected_model(self, user_id: StateActor) -> Optional[str]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            value = str(user_data.get("selected_model") or "").strip()
+            return value or None
+
     def set_pending_session_pick(self, user_id: StateActor, enabled: bool) -> None:
         with self._lock:
             user_data = self._get_user_unlocked(user_id)
@@ -351,6 +363,33 @@ class BotState:
             user_data["active_cwd"] = cwd
             self._save_unlocked()
             return True
+
+    def set_model_picker(self, user_id: StateActor, models: List[str]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["pending_model_pick"] = True
+            user_data["model_picker"] = {
+                "models": [str(model) for model in models],
+            }
+            self._save_unlocked()
+
+    def is_pending_model_pick(self, user_id: StateActor) -> bool:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            return bool(user_data.get("pending_model_pick"))
+
+    def get_model_picker(self, user_id: StateActor) -> Dict[str, Any]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            picker = user_data.get("model_picker")
+            return dict(picker) if isinstance(picker, dict) else {}
+
+    def clear_model_picker(self, user_id: StateActor) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["pending_model_pick"] = False
+            user_data.pop("model_picker", None)
+            self._save_unlocked()
 
 
 class RunningPromptRegistry:
@@ -449,6 +488,7 @@ class CodexRunner:
         prompt: str,
         cwd: Path,
         session_id: Optional[str] = None,
+        model: Optional[str] = None,
         on_update: Optional[Callable[[str], None]] = None,
     ) -> Tuple[Optional[str], str, str, int]:
         config_flags: List[str] = []
@@ -459,6 +499,9 @@ class CodexRunner:
             config_flags.extend(["-c", f"approval_policy={self._to_toml_string(approval_policy)}"])
 
         exec_flags: List[str] = ["--json", "--skip-git-repo-check"]
+        normalized_model = str(model or "").strip()
+        if normalized_model:
+            exec_flags.extend(["-m", normalized_model])
         if self.dangerous_bypass_level >= 2:
             exec_flags.append("--dangerously-bypass-approvals-and-sandbox")
 
