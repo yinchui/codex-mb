@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex_common import BotState, SessionStore
-from feishu_longconn_service import FeishuCodexService
+from feishu_longconn_service import FeishuAPI, FeishuCodexService
 
 
 def write_session_file(root: Path, session_id: str, cwd: str, title_prompt: str) -> None:
@@ -101,6 +101,162 @@ class _RunningPromptRegistryStub:
 
     def count(self, actor) -> int:
         return 0
+
+
+class _FakeLarkResponse:
+    def __init__(self, *, ok: bool = True, data=None) -> None:
+        self._ok = ok
+        self.data = data
+        self.code = 0 if ok else 500
+        self.msg = "ok" if ok else "error"
+
+    def success(self) -> bool:
+        return self._ok
+
+    def get_log_id(self) -> str:
+        return "log-1"
+
+
+class _FakeFeishuClient:
+    class _ImageService:
+        def __init__(self, outer) -> None:
+            self.outer = outer
+
+        def create(self, request):
+            self.outer.image_create_requests.append(request)
+            data = type("ImageData", (), {"image_key": "img-key-1"})()
+            return _FakeLarkResponse(ok=True, data=data)
+
+    class _FileService:
+        def __init__(self, outer) -> None:
+            self.outer = outer
+
+        def create(self, request):
+            self.outer.file_create_requests.append(request)
+            data = type("FileData", (), {"file_key": "file-key-1"})()
+            return _FakeLarkResponse(ok=True, data=data)
+
+    class _MessageService:
+        def __init__(self, outer) -> None:
+            self.outer = outer
+
+        def create(self, request):
+            self.outer.message_create_requests.append(request)
+            return _FakeLarkResponse(ok=True)
+
+    class _V1Service:
+        def __init__(self, outer) -> None:
+            self.image = _FakeFeishuClient._ImageService(outer)
+            self.file = _FakeFeishuClient._FileService(outer)
+            self.message = _FakeFeishuClient._MessageService(outer)
+
+    class _ImService:
+        def __init__(self, outer) -> None:
+            self.v1 = _FakeFeishuClient._V1Service(outer)
+
+    def __init__(self) -> None:
+        self.image_create_requests = []
+        self.file_create_requests = []
+        self.message_create_requests = []
+        self.im = _FakeFeishuClient._ImService(self)
+
+
+class FeishuApiAttachmentTests(unittest.TestCase):
+    @staticmethod
+    def _build_api_with_fake_client(fake_client: _FakeFeishuClient) -> FeishuAPI:
+        api = object.__new__(FeishuAPI)
+        api.client = fake_client
+        api.level = "INFO"
+        api.rich_message_enabled = True
+        return api
+
+    def test_send_image_path_uses_feishu_image_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "preview.png"
+            image_path.write_bytes(b"fake-image")
+            fake_client = _FakeFeishuClient()
+            api = self._build_api_with_fake_client(fake_client)
+
+            ok = api.send_image_path("chat-1", image_path)
+
+            self.assertTrue(ok)
+            self.assertEqual(len(fake_client.image_create_requests), 1)
+            self.assertEqual(len(fake_client.message_create_requests), 1)
+            message_req = fake_client.message_create_requests[-1]
+            self.assertEqual(message_req.request_body.msg_type, "image")
+            self.assertEqual(json.loads(message_req.request_body.content), {"image_key": "img-key-1"})
+
+    def test_send_file_path_uses_feishu_file_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "notes.txt"
+            file_path.write_text("hello", encoding="utf-8")
+            fake_client = _FakeFeishuClient()
+            api = self._build_api_with_fake_client(fake_client)
+
+            ok = api.send_file_path("chat-1", file_path)
+
+            self.assertTrue(ok)
+            self.assertEqual(len(fake_client.file_create_requests), 1)
+            self.assertEqual(len(fake_client.message_create_requests), 1)
+            message_req = fake_client.message_create_requests[-1]
+            self.assertEqual(message_req.request_body.msg_type, "file")
+            self.assertEqual(json.loads(message_req.request_body.content), {"file_key": "file-key-1"})
+
+    def test_send_image_path_logs_when_path_missing(self) -> None:
+        fake_client = _FakeFeishuClient()
+        api = self._build_api_with_fake_client(fake_client)
+
+        with patch("feishu_longconn_service.log") as mock_log:
+            ok = api.send_image_path("chat-1", Path("/tmp/definitely-not-exists-image.png"))
+
+        self.assertFalse(ok)
+        mock_log.assert_called_once()
+
+    def test_send_file_path_logs_when_path_missing(self) -> None:
+        fake_client = _FakeFeishuClient()
+        api = self._build_api_with_fake_client(fake_client)
+
+        with patch("feishu_longconn_service.log") as mock_log:
+            ok = api.send_file_path("chat-1", Path("/tmp/definitely-not-exists-file.pdf"))
+
+        self.assertFalse(ok)
+        mock_log.assert_called_once()
+
+    def test_send_image_path_logs_when_upload_key_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "preview.png"
+            image_path.write_bytes(b"fake-image")
+            fake_client = _FakeFeishuClient()
+            api = self._build_api_with_fake_client(fake_client)
+
+            def _missing_key_response(_request):
+                data = type("ImageData", (), {"image_key": ""})()
+                return _FakeLarkResponse(ok=True, data=data)
+
+            fake_client.im.v1.image.create = _missing_key_response
+            with patch("feishu_longconn_service.log") as mock_log:
+                ok = api.send_image_path("chat-1", image_path)
+
+            self.assertFalse(ok)
+            mock_log.assert_called_once()
+
+    def test_send_file_path_logs_when_upload_key_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "notes.txt"
+            file_path.write_text("hello", encoding="utf-8")
+            fake_client = _FakeFeishuClient()
+            api = self._build_api_with_fake_client(fake_client)
+
+            def _missing_key_response(_request):
+                data = type("FileData", (), {"file_key": ""})()
+                return _FakeLarkResponse(ok=True, data=data)
+
+            fake_client.im.v1.file.create = _missing_key_response
+            with patch("feishu_longconn_service.log") as mock_log:
+                ok = api.send_file_path("chat-1", file_path)
+
+            self.assertFalse(ok)
+            mock_log.assert_called_once()
 
 
 class FeishuModelAccountTests(unittest.TestCase):

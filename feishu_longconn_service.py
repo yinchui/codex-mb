@@ -307,6 +307,79 @@ class FeishuAPI:
             ok = ok and sent
         return ok
 
+    def send_image_path(self, chat_id: str, path: Path) -> bool:
+        file_path = path.expanduser()
+        if not file_path.exists() or not file_path.is_file():
+            log(f"image send skipped: invalid path {file_path}")
+            return False
+        with file_path.open("rb") as f:
+            upload_request = (
+                lark.im.v1.CreateImageRequest.builder()
+                .request_body(
+                    lark.im.v1.CreateImageRequestBody.builder()
+                    .image_type("message")
+                    .image(f)
+                    .build()
+                )
+                .build()
+            )
+            upload_response = self.client.im.v1.image.create(upload_request)
+        if not upload_response.success():
+            log(
+                "image upload failed: "
+                f"code={upload_response.code} msg={upload_response.msg} "
+                f"log_id={upload_response.get_log_id()}"
+            )
+            return False
+        image_key = str(getattr(getattr(upload_response, "data", None), "image_key", "") or "").strip()
+        if not image_key:
+            log(f"image upload missing key: path={file_path}")
+            return False
+        return self._send_attachment_key(
+            receive_id_type="chat_id",
+            receive_id=chat_id,
+            msg_type="image",
+            key_name="image_key",
+            key_value=image_key,
+        )
+
+    def send_file_path(self, chat_id: str, path: Path) -> bool:
+        file_path = path.expanduser()
+        if not file_path.exists() or not file_path.is_file():
+            log(f"file send skipped: invalid path {file_path}")
+            return False
+        with file_path.open("rb") as f:
+            upload_request = (
+                lark.im.v1.CreateFileRequest.builder()
+                .request_body(
+                    lark.im.v1.CreateFileRequestBody.builder()
+                    .file_type("stream")
+                    .file_name(file_path.name)
+                    .file(f)
+                    .build()
+                )
+                .build()
+            )
+            upload_response = self.client.im.v1.file.create(upload_request)
+        if not upload_response.success():
+            log(
+                "file upload failed: "
+                f"code={upload_response.code} msg={upload_response.msg} "
+                f"log_id={upload_response.get_log_id()}"
+            )
+            return False
+        file_key = str(getattr(getattr(upload_response, "data", None), "file_key", "") or "").strip()
+        if not file_key:
+            log(f"file upload missing key: path={file_path}")
+            return False
+        return self._send_attachment_key(
+            receive_id_type="chat_id",
+            receive_id=chat_id,
+            msg_type="file",
+            key_name="file_key",
+            key_value=file_key,
+        )
+
     def _send_text(self, receive_id_type: str, receive_id: str, text: str) -> bool:
         request = (
             lark.im.v1.CreateMessageRequest.builder()
@@ -327,6 +400,37 @@ class FeishuAPI:
             "send failed: "
             f"code={response.code} msg={response.msg} "
             f"log_id={response.get_log_id()} receive_id_type={receive_id_type}"
+        )
+        return False
+
+    def _send_attachment_key(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        msg_type: str,
+        key_name: str,
+        key_value: str,
+    ) -> bool:
+        request = (
+            lark.im.v1.CreateMessageRequest.builder()
+            .receive_id_type(receive_id_type)
+            .request_body(
+                lark.im.v1.CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .msg_type(msg_type)
+                .content(json.dumps({key_name: key_value}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        response = self.client.im.v1.message.create(request)
+        if response.success():
+            return True
+        log(
+            "send failed: "
+            f"code={response.code} msg={response.msg} "
+            f"log_id={response.get_log_id()} receive_id_type={receive_id_type} "
+            f"msg_type={msg_type}"
         )
         return False
 
