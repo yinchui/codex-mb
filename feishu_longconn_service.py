@@ -23,9 +23,11 @@ from codex_common import (
     SessionStore,
     chunk_text,
     env,
+    extract_attachment_name_hints,
     extract_local_attachment_candidates,
     fetch_provider_account_info,
     is_attachment_send_intent,
+    is_allowed_home_attachment_path,
     list_provider_models,
     load_codex_default_model,
     log,
@@ -1051,9 +1053,30 @@ class FeishuCodexService:
     def _attachment_state_key(chat_id: str, actor_id: str) -> str:
         return f"{chat_id}::{actor_id}"
 
-    def _recent_attachment_candidates(self, chat_id: str, actor_id: str) -> List[Dict[str, str]]:
+    def _is_managed_attachment_path(self, path: Path) -> bool:
+        try:
+            resolved = Path(path).expanduser().resolve()
+            managed_dir = self._attachment_output_dir().resolve()
+            resolved.relative_to(managed_dir)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _attachment_display_name(candidate: Dict[str, str]) -> str:
+        raw_name = str(candidate.get("name") or "").strip()
+        if raw_name:
+            normalized = Path(raw_name).name.strip()
+            if normalized:
+                return normalized
+        raw_path = str(candidate.get("path") or "").strip()
+        normalized_path = Path(raw_path).name.strip()
+        return normalized_path or "该文件"
+
+    def _recent_attachment_candidates(self, chat_id: str, actor_id: str) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         state_key = self._attachment_state_key(chat_id, actor_id)
         candidates: List[Dict[str, str]] = []
+        rejected: List[Dict[str, str]] = []
         for item in self.state.get_recent_attachments(state_key):
             path = Path(str(item.get("path") or "").strip()).expanduser()
             kind = str(item.get("kind") or "").strip()
@@ -1062,8 +1085,34 @@ class FeishuCodexService:
                 continue
             if kind not in ("image", "file"):
                 continue
+            allowed, reason = is_allowed_home_attachment_path(path)
+            if not allowed and reason == "outside_home" and self._is_managed_attachment_path(path):
+                allowed = True
+                reason = None
+            if not allowed:
+                rejected.append(
+                    {
+                        "path": str(path),
+                        "kind": kind,
+                        "name": name or path.name,
+                        "reason": reason or "unknown",
+                    }
+                )
+                continue
             candidates.append({"path": str(path), "kind": kind, "name": name or path.name})
-        return candidates
+        return candidates, rejected
+
+    @staticmethod
+    def _attachment_policy_reject_message(candidate: Dict[str, str]) -> str:
+        reason = str(candidate.get("reason") or "").strip()
+        name = FeishuCodexService._attachment_display_name(candidate)
+        if reason == "sensitive_path":
+            return f"根据安全策略，不允许发送敏感目录中的文件：{name}"
+        if reason == "outside_home":
+            return f"根据安全策略，仅允许发送 Home 目录中的文件：{name}"
+        if reason == "unsupported_type":
+            return f"根据安全策略，不允许发送该类型文件：{name}"
+        return f"根据安全策略，不允许发送该文件：{name}"
 
     def _send_attachment_candidate(self, chat_id: str, candidate: Dict[str, str]) -> Tuple[bool, Optional[str]]:
         path = Path(candidate["path"])
@@ -1086,10 +1135,23 @@ class FeishuCodexService:
         state_key = self._attachment_state_key(chat_id, actor_id)
         if not is_attachment_send_intent(text):
             return False
-        candidates = self._recent_attachment_candidates(chat_id, actor_id)
+        candidates, rejected = self._recent_attachment_candidates(chat_id, actor_id)
+        hints = extract_attachment_name_hints(text)
+        if hints:
+            hint_keys = {hint.lower() for hint in hints}
+            hinted_candidates = [item for item in candidates if str(item.get("name") or "").lower() in hint_keys]
+            if hinted_candidates:
+                candidates = hinted_candidates
+            else:
+                hinted_rejected = [item for item in rejected if str(item.get("name") or "").lower() in hint_keys]
+                candidates = []
+                rejected = hinted_rejected
         if not candidates:
             self.state.clear_attachment_picker(state_key)
-            self.api.send_message(chat_id, "当前没有可发送的最近附件。先让我生成或提到文件路径，再发送“发给我”。")
+            if rejected:
+                self.api.send_message(chat_id, self._attachment_policy_reject_message(rejected[0]))
+            else:
+                self.api.send_message(chat_id, "当前没有可发送的最近附件。先让我生成或提到文件路径，再发送“发给我”。")
             return True
         if len(candidates) > 1:
             lines = ["找到多个最近附件，回复编号即可发送:"]

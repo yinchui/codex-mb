@@ -469,7 +469,8 @@ class FeishuModelAccountTests(unittest.TestCase):
                 [{"path": str(image_path), "kind": "image", "name": "preview.png"}],
             )
 
-            service._handle_text("chat-1", "user-1", "发给我")
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "发给我")
 
             self.assertEqual(api.sent_images, [("chat-1", str(image_path))])
             self.assertEqual(api.sent_files, [])
@@ -486,11 +487,208 @@ class FeishuModelAccountTests(unittest.TestCase):
                 [{"path": str(file_path), "kind": "file", "name": "notes.txt"}],
             )
 
-            service._handle_text("chat-1", "user-1", "把文件发给我")
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "把文件发给我")
 
             self.assertEqual(api.sent_images, [])
             self.assertEqual(api.sent_files, [("chat-1", str(file_path))])
             self.assertEqual(codex.calls, [])
+
+    def test_send_intent_sends_allowed_home_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home_dir = root / "home"
+            file_path = home_dir / "Documents" / "notes.txt"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text("hello", encoding="utf-8")
+            service, api, state, codex = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(file_path), "kind": "file", "name": "notes.txt"}],
+            )
+
+            with patch("codex_common.Path.home", return_value=home_dir):
+                service._handle_text("chat-1", "user-1", "把这个发给我")
+
+            self.assertEqual(api.sent_files, [("chat-1", str(file_path))])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(codex.calls, [])
+
+    def test_send_intent_sends_managed_attachment_candidate_outside_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            managed_path = root / "attachments" / "notes.txt"
+            managed_path.parent.mkdir(parents=True, exist_ok=True)
+            managed_path.write_text("hello", encoding="utf-8")
+            service, api, state, codex = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(managed_path), "kind": "file", "name": "notes.txt"}],
+            )
+
+            with patch("codex_common.Path.home", return_value=root / "elsewhere-home"):
+                service._handle_text("chat-1", "user-1", "把这个发给我")
+
+            self.assertEqual(api.sent_files, [("chat-1", str(managed_path))])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(codex.calls, [])
+
+    def test_send_intent_rejects_sensitive_candidate_without_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home_dir = root / "home"
+            file_path = home_dir / ".ssh" / "id_rsa.txt"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text("secret", encoding="utf-8")
+            service, api, state, codex = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(file_path), "kind": "file", "name": "id_rsa.txt"}],
+            )
+
+            with patch("codex_common.Path.home", return_value=home_dir):
+                service._handle_text("chat-1", "user-1", "发给我")
+
+            self.assertEqual(api.sent_files, [])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(codex.calls, [])
+            self.assertIn("安全策略", api.sent_messages[-1][1])
+            self.assertIn("不允许发送", api.sent_messages[-1][1])
+
+    def test_send_intent_rejection_message_does_not_expose_absolute_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home_dir = root / "home"
+            file_path = home_dir / ".ssh" / "id_rsa.txt"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text("secret", encoding="utf-8")
+            service, api, state, codex = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(file_path), "kind": "file", "name": "id_rsa.txt"}],
+            )
+
+            with patch("codex_common.Path.home", return_value=home_dir):
+                service._handle_text("chat-1", "user-1", "发给我")
+
+            self.assertEqual(api.sent_files, [])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(codex.calls, [])
+            text = api.sent_messages[-1][1]
+            self.assertIn("id_rsa.txt", text)
+            self.assertNotIn(str(file_path), text)
+
+    def test_send_intent_prefers_filename_hint_over_multiple_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home_dir = root / "home"
+            image_path = home_dir / "Pictures" / "preview.png"
+            file_path = home_dir / "Documents" / "notes.txt"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            image_path.write_bytes(b"image-bytes")
+            file_path.write_text("hello", encoding="utf-8")
+            service, api, state, codex = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [
+                    {"path": str(image_path), "kind": "image", "name": "preview.png"},
+                    {"path": str(file_path), "kind": "file", "name": "notes.txt"},
+                ],
+            )
+
+            with patch("codex_common.Path.home", return_value=home_dir):
+                service._handle_text("chat-1", "user-1", "notes.txt，把这个发给我")
+
+            self.assertEqual(api.sent_files, [("chat-1", str(file_path))])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(codex.calls, [])
+            self.assertFalse(state.is_pending_attachment_pick("chat-1::user-1"))
+
+    def test_send_intent_unmatched_filename_hint_does_not_fallback_to_other_allowed_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home_dir = root / "home"
+            image_path = home_dir / "Pictures" / "preview.png"
+            file_path = home_dir / "Documents" / "notes.txt"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            image_path.write_bytes(b"image-bytes")
+            file_path.write_text("hello", encoding="utf-8")
+            service, api, state, codex = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [
+                    {"path": str(image_path), "kind": "image", "name": "preview.png"},
+                    {"path": str(file_path), "kind": "file", "name": "notes.txt"},
+                ],
+            )
+
+            with patch("codex_common.Path.home", return_value=home_dir):
+                service._handle_text("chat-1", "user-1", "report.pdf，把这个发给我")
+
+            self.assertEqual(api.sent_files, [])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(codex.calls, [])
+            self.assertIn("没有可发送", api.sent_messages[-1][1])
+            self.assertFalse(state.is_pending_attachment_pick("chat-1::user-1"))
+
+    def test_send_intent_hint_collision_uses_allowed_match_even_when_rejected_duplicate_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home_dir = root / "home"
+            allowed_path = home_dir / "Documents" / "report.pdf"
+            rejected_path = home_dir / ".ssh" / "report.pdf"
+            allowed_path.parent.mkdir(parents=True, exist_ok=True)
+            rejected_path.parent.mkdir(parents=True, exist_ok=True)
+            allowed_path.write_text("public", encoding="utf-8")
+            rejected_path.write_text("secret", encoding="utf-8")
+            service, api, state, codex = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [
+                    {"path": str(rejected_path), "kind": "file", "name": "report.pdf"},
+                    {"path": str(allowed_path), "kind": "file", "name": "report.pdf"},
+                ],
+            )
+
+            with patch("codex_common.Path.home", return_value=home_dir):
+                service._handle_text("chat-1", "user-1", "report.pdf，把这个发给我")
+
+            self.assertEqual(api.sent_files, [("chat-1", str(allowed_path))])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(codex.calls, [])
+            self.assertEqual(api.sent_messages, [])
+            self.assertFalse(state.is_pending_attachment_pick("chat-1::user-1"))
+
+    def test_send_intent_hint_to_rejected_file_does_not_fallback_to_allowed_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home_dir = root / "home"
+            allowed_path = home_dir / "Documents" / "notes.txt"
+            rejected_path = home_dir / ".ssh" / "id_rsa.txt"
+            allowed_path.parent.mkdir(parents=True, exist_ok=True)
+            rejected_path.parent.mkdir(parents=True, exist_ok=True)
+            allowed_path.write_text("hello", encoding="utf-8")
+            rejected_path.write_text("secret", encoding="utf-8")
+            service, api, state, codex = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [
+                    {"path": str(allowed_path), "kind": "file", "name": "notes.txt"},
+                    {"path": str(rejected_path), "kind": "file", "name": "id_rsa.txt"},
+                ],
+            )
+
+            with patch("codex_common.Path.home", return_value=home_dir):
+                service._handle_text("chat-1", "user-1", "id_rsa.txt，把这个发给我")
+
+            self.assertEqual(api.sent_files, [])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(codex.calls, [])
+            self.assertIn("安全策略", api.sent_messages[-1][1])
+            self.assertIn("不允许发送", api.sent_messages[-1][1])
+            self.assertIn("id_rsa.txt", api.sent_messages[-1][1])
 
     def test_send_intent_without_candidate_returns_helpful_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -520,7 +718,8 @@ class FeishuModelAccountTests(unittest.TestCase):
 
             api.send_image_path = _raise_permission_error
 
-            service._handle_text("chat-1", "user-1", "发给我")
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "发给我")
 
             self.assertEqual(codex.calls, [])
             self.assertIn("没有权限读取", api.sent_messages[-1][1])
@@ -541,7 +740,8 @@ class FeishuModelAccountTests(unittest.TestCase):
                 ],
             )
 
-            service._handle_text("chat-1", "user-1", "发给我")
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "发给我")
 
             self.assertEqual(api.sent_images, [])
             self.assertEqual(api.sent_files, [])
@@ -568,8 +768,9 @@ class FeishuModelAccountTests(unittest.TestCase):
                 ],
             )
 
-            service._handle_text("chat-1", "user-1", "发给我")
-            service._handle_text("chat-1", "user-1", "2")
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "发给我")
+                service._handle_text("chat-1", "user-1", "2")
 
             self.assertEqual(api.sent_images, [])
             self.assertEqual(api.sent_files, [("chat-1", str(file_path))])
