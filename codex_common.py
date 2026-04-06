@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -93,6 +94,61 @@ StateActor = Union[int, str]
 
 class ProviderLookupError(RuntimeError):
     pass
+
+
+SUPPORTED_ATTACHMENT_EXTENSIONS = {
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".webp": "image",
+    ".pdf": "file",
+    ".md": "file",
+    ".txt": "file",
+    ".zip": "file",
+}
+ATTACHMENT_SEND_INTENT_PATTERNS = (
+    "发给我",
+    "把图片发我",
+    "把文件发来",
+    "作为附件发送",
+)
+ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9_./-])(/[^\s`<>\"'，。；;]+)")
+
+
+def extract_local_attachment_candidates(text: str) -> List[Dict[str, str]]:
+    value = str(text or "")
+    candidates: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    for raw_match in ABSOLUTE_PATH_PATTERN.findall(value):
+        raw_path = raw_match.rstrip(".,，。；;:)]}!?")
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            continue
+        ext = path.suffix.lower()
+        kind = SUPPORTED_ATTACHMENT_EXTENSIONS.get(ext)
+        if not kind:
+            continue
+        if not path.exists() or not path.is_file():
+            continue
+        normalized = str(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        candidates.append(
+            {
+                "path": normalized,
+                "kind": kind,
+                "name": path.name,
+            }
+        )
+    return candidates
+
+
+def is_attachment_send_intent(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    return any(token in value for token in ATTACHMENT_SEND_INTENT_PATTERNS)
 
 
 class SessionStore:
@@ -389,6 +445,85 @@ class BotState:
             user_data = self._get_user_unlocked(user_id)
             user_data["pending_model_pick"] = False
             user_data.pop("model_picker", None)
+            self._save_unlocked()
+
+    def set_recent_attachments(self, user_id: StateActor, attachments: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            normalized: List[Dict[str, str]] = []
+            for item in attachments:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "").strip()
+                kind = str(item.get("kind") or "").strip()
+                name = str(item.get("name") or "").strip()
+                if not path or not kind or not name:
+                    continue
+                normalized.append(
+                    {
+                        "path": path,
+                        "kind": kind,
+                        "name": name,
+                    }
+                )
+            user_data["recent_attachments"] = normalized
+            self._save_unlocked()
+
+    def get_recent_attachments(self, user_id: StateActor) -> List[Dict[str, str]]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            values = user_data.get("recent_attachments")
+            if not isinstance(values, list):
+                return []
+            result: List[Dict[str, str]] = []
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "").strip()
+                kind = str(item.get("kind") or "").strip()
+                name = str(item.get("name") or "").strip()
+                if not path or not kind or not name:
+                    continue
+                result.append({"path": path, "kind": kind, "name": name})
+            return result
+
+    def set_attachment_picker(self, user_id: StateActor, attachments: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            normalized: List[Dict[str, str]] = []
+            for item in attachments:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "").strip()
+                kind = str(item.get("kind") or "").strip()
+                name = str(item.get("name") or "").strip()
+                if not path or not kind or not name:
+                    continue
+                normalized.append({"path": path, "kind": kind, "name": name})
+            if normalized:
+                user_data["pending_attachment_pick"] = True
+                user_data["attachment_picker"] = {"attachments": normalized}
+            else:
+                user_data["pending_attachment_pick"] = False
+                user_data.pop("attachment_picker", None)
+            self._save_unlocked()
+
+    def is_pending_attachment_pick(self, user_id: StateActor) -> bool:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            return bool(user_data.get("pending_attachment_pick"))
+
+    def get_attachment_picker(self, user_id: StateActor) -> Dict[str, Any]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            picker = user_data.get("attachment_picker")
+            return dict(picker) if isinstance(picker, dict) else {}
+
+    def clear_attachment_picker(self, user_id: StateActor) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["pending_attachment_pick"] = False
+            user_data.pop("attachment_picker", None)
             self._save_unlocked()
 
 

@@ -9,7 +9,9 @@ from codex_common import (
     BotState,
     CodexRunner,
     ProviderLookupError,
+    extract_local_attachment_candidates,
     fetch_provider_account_info,
+    is_attachment_send_intent,
     list_provider_models,
     load_codex_api_key,
     load_codex_base_url,
@@ -145,6 +147,113 @@ class BotStateModelTests(unittest.TestCase):
 
             self.assertFalse(state.is_pending_model_pick("user-1"))
             self.assertEqual(state.get_model_picker("user-1"), {})
+
+
+class AttachmentHelpersTests(unittest.TestCase):
+    def test_extract_local_attachment_candidates_keeps_existing_absolute_supported_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "screen.png"
+            note_path = root / "notes.md"
+            unsupported_path = root / "raw.bin"
+            relative_path = Path("local.txt")
+            missing_path = root / "missing.pdf"
+
+            image_path.write_text("png", encoding="utf-8")
+            note_path.write_text("hello", encoding="utf-8")
+            unsupported_path.write_text("bin", encoding="utf-8")
+            (root / relative_path).write_text("rel", encoding="utf-8")
+
+            text = "\n".join(
+                [
+                    f"image: {image_path}",
+                    f"note: `{note_path}`",
+                    f"unsupported: {unsupported_path}",
+                    f"relative: {relative_path}",
+                    f"missing: {missing_path}",
+                ]
+            )
+
+            candidates = extract_local_attachment_candidates(text)
+
+            self.assertEqual(
+                candidates,
+                [
+                    {"path": str(image_path), "kind": "image", "name": "screen.png"},
+                    {"path": str(note_path), "kind": "file", "name": "notes.md"},
+                ],
+            )
+
+    def test_is_attachment_send_intent_matches_explicit_phrases(self) -> None:
+        self.assertTrue(is_attachment_send_intent("发给我"))
+        self.assertTrue(is_attachment_send_intent("把图片发我"))
+        self.assertTrue(is_attachment_send_intent("把文件发来"))
+        self.assertTrue(is_attachment_send_intent("作为附件发送"))
+        self.assertFalse(is_attachment_send_intent("你好，今天天气怎么样"))
+
+    def test_extract_local_attachment_candidates_deduplicates_same_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "same.png"
+            image_path.write_text("png", encoding="utf-8")
+            text = f"{image_path}\nagain: `{image_path}`"
+
+            candidates = extract_local_attachment_candidates(text)
+
+            self.assertEqual(
+                candidates,
+                [{"path": str(image_path), "kind": "image", "name": "same.png"}],
+            )
+
+    def test_extract_local_attachment_candidates_accepts_trailing_colon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "shot.png"
+            image_path.write_text("png", encoding="utf-8")
+
+            candidates = extract_local_attachment_candidates(f"path: {image_path}:")
+
+            self.assertEqual(
+                candidates,
+                [{"path": str(image_path), "kind": "image", "name": "shot.png"}],
+            )
+
+    def test_bot_state_persists_recent_attachments_and_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+            key = "chat-1::user-1"
+            attachments = [
+                {"path": "/Users/aa/Desktop/a.png", "kind": "image", "name": "a.png"},
+                {"path": "/Users/aa/Desktop/b.pdf", "kind": "file", "name": "b.pdf"},
+            ]
+
+            state.set_recent_attachments(key, attachments)
+            state.set_attachment_picker(key, attachments)
+
+            self.assertEqual(state.get_recent_attachments(key), attachments)
+            self.assertTrue(state.is_pending_attachment_pick(key))
+            self.assertEqual(state.get_attachment_picker(key).get("attachments"), attachments)
+
+            state.clear_attachment_picker(key)
+
+            self.assertFalse(state.is_pending_attachment_pick(key))
+            self.assertEqual(state.get_attachment_picker(key), {})
+
+    def test_bot_state_empty_attachment_picker_does_not_set_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+            key = "chat-1::user-2"
+
+            state.set_attachment_picker(
+                key,
+                [
+                    {},
+                    {"path": "", "kind": "image", "name": "bad.png"},
+                ],
+            )
+
+            self.assertFalse(state.is_pending_attachment_pick(key))
+            self.assertEqual(state.get_attachment_picker(key), {})
 
 
 class _FakePipe:
