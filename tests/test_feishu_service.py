@@ -440,6 +440,24 @@ class FeishuModelAccountTests(unittest.TestCase):
                 [{"path": "/tmp/old.txt", "kind": "file", "name": "old.txt"}],
             )
 
+    def test_prompt_worker_includes_safe_attachment_output_dir_instruction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, _, _, codex = self.build_service(root)
+
+            service._run_prompt_worker(
+                chat_id="chat-1",
+                actor_id="user-1",
+                prompt="截一张现在电脑的屏幕",
+                active_id=None,
+                cwd=root,
+                session_label="新会话 | tmp",
+            )
+
+            prompt = codex.calls[-1]["prompt"]
+            self.assertIn(str(root / "attachments"), prompt)
+            self.assertIn("不要保存到 ~/Desktop", prompt)
+
     def test_send_intent_auto_sends_single_recent_image(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -485,6 +503,27 @@ class FeishuModelAccountTests(unittest.TestCase):
             self.assertEqual(api.sent_files, [])
             self.assertEqual(codex.calls, [])
             self.assertIn("没有可发送", api.sent_messages[-1][1])
+
+    def test_send_intent_permission_error_returns_helpful_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            image_path = root / "preview.png"
+            image_path.write_bytes(b"image-bytes")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(image_path), "kind": "image", "name": "preview.png"}],
+            )
+
+            def _raise_permission_error(_chat_id, _path):
+                raise PermissionError("Operation not permitted")
+
+            api.send_image_path = _raise_permission_error
+
+            service._handle_text("chat-1", "user-1", "发给我")
+
+            self.assertEqual(codex.calls, [])
+            self.assertIn("没有权限读取", api.sent_messages[-1][1])
 
     def test_send_intent_with_multiple_candidates_prompts_for_number(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

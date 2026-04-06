@@ -584,6 +584,25 @@ class FeishuCodexService:
             event_handler=self.event_handler,
         )
 
+    def _attachment_output_dir(self) -> Path:
+        target = self.state.path.parent / "attachments"
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _prompt_with_attachment_guidance(self, prompt: str) -> str:
+        attachment_dir = self._attachment_output_dir()
+        guidance = "\n".join(
+            [
+                "[飞书附件约束]",
+                "如果你要创建任何本地文件、截图、导出结果，并准备稍后发回飞书聊天，必须保存到这个目录：",
+                str(attachment_dir),
+                "最终回复里请使用绝对路径 Markdown 链接，例如 [文件名](/abs/path/file.png)。",
+                "不要保存到 ~/Desktop、~/Documents、~/Downloads。",
+                "如果这次不需要创建文件，就按正常方式回答。",
+            ]
+        )
+        return f"{guidance}\n\n[用户请求]\n{prompt}"
+
     def run_forever(self) -> None:
         log(
             "feishu long connection service started "
@@ -1046,11 +1065,22 @@ class FeishuCodexService:
             candidates.append({"path": str(path), "kind": kind, "name": name or path.name})
         return candidates
 
-    def _send_attachment_candidate(self, chat_id: str, candidate: Dict[str, str]) -> bool:
+    def _send_attachment_candidate(self, chat_id: str, candidate: Dict[str, str]) -> Tuple[bool, Optional[str]]:
         path = Path(candidate["path"])
-        if candidate["kind"] == "image":
-            return self.api.send_image_path(chat_id, path)
-        return self.api.send_file_path(chat_id, path)
+        try:
+            if candidate["kind"] == "image":
+                ok = self.api.send_image_path(chat_id, path)
+            else:
+                ok = self.api.send_file_path(chat_id, path)
+        except PermissionError:
+            log(f"attachment send permission denied: path={path}")
+            return False, f"没有权限读取这个附件源文件：{path}\n请让我重新生成到机器人可访问的目录后再发送。"
+        except OSError as exc:
+            log(f"attachment send failed with os error: path={path} error={exc}")
+            return False, f"附件读取失败：{path}\n请让我重新生成或换个目录后再发送。"
+        if not ok:
+            return False, "附件发送失败了，请稍后再试。"
+        return True, None
 
     def _try_handle_attachment_send_intent(self, chat_id: str, actor_id: str, text: str) -> bool:
         state_key = self._attachment_state_key(chat_id, actor_id)
@@ -1072,9 +1102,9 @@ class FeishuCodexService:
             self.api.send_message(chat_id, "\n".join(lines))
             return True
         self.state.clear_attachment_picker(state_key)
-        ok = self._send_attachment_candidate(chat_id, candidates[0])
-        if not ok:
-            self.api.send_message(chat_id, "附件发送失败了，请稍后再试。")
+        ok, error_message = self._send_attachment_candidate(chat_id, candidates[0])
+        if not ok and error_message:
+            self.api.send_message(chat_id, error_message)
         return True
 
     def _try_handle_attachment_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
@@ -1094,7 +1124,7 @@ class FeishuCodexService:
         if not isinstance(candidate, dict):
             self.api.send_message(chat_id, "附件编号无效。请重新发送编号。")
             return True
-        ok = self._send_attachment_candidate(
+        ok, error_message = self._send_attachment_candidate(
             chat_id,
             {
                 "path": str(candidate.get("path") or "").strip(),
@@ -1103,8 +1133,8 @@ class FeishuCodexService:
             },
         )
         self.state.clear_attachment_picker(state_key)
-        if not ok:
-            self.api.send_message(chat_id, "附件发送失败了，请稍后再试。")
+        if not ok and error_message:
+            self.api.send_message(chat_id, error_message)
         return True
 
     def _finalize_stream_reply(
@@ -1278,8 +1308,9 @@ class FeishuCodexService:
 
         try:
             selected_model = self.state.get_selected_model(actor_id)
+            effective_prompt = self._prompt_with_attachment_guidance(prompt)
             thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
-                prompt=prompt,
+                prompt=effective_prompt,
                 cwd=cwd,
                 session_id=active_id,
                 model=selected_model,
