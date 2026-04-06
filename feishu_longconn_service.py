@@ -25,6 +25,7 @@ from codex_common import (
     env,
     extract_local_attachment_candidates,
     fetch_provider_account_info,
+    is_attachment_send_intent,
     list_provider_models,
     load_codex_default_model,
     log,
@@ -685,6 +686,8 @@ class FeishuCodexService:
 
     def _handle_text(self, chat_id: str, actor_id: str, text: str) -> None:
         if not text.startswith("/"):
+            if self._try_handle_attachment_send_intent(chat_id, actor_id, text):
+                return
             if self._try_handle_quick_model_pick(chat_id, actor_id, text):
                 return
             if self._try_handle_quick_session_pick(chat_id, actor_id, text):
@@ -1023,6 +1026,41 @@ class FeishuCodexService:
     @staticmethod
     def _attachment_state_key(chat_id: str, actor_id: str) -> str:
         return f"{chat_id}::{actor_id}"
+
+    def _recent_attachment_candidates(self, chat_id: str, actor_id: str) -> List[Dict[str, str]]:
+        state_key = self._attachment_state_key(chat_id, actor_id)
+        candidates: List[Dict[str, str]] = []
+        for item in self.state.get_recent_attachments(state_key):
+            path = Path(str(item.get("path") or "").strip()).expanduser()
+            kind = str(item.get("kind") or "").strip()
+            name = str(item.get("name") or path.name).strip()
+            if not path.is_absolute() or not path.exists() or not path.is_file():
+                continue
+            if kind not in ("image", "file"):
+                continue
+            candidates.append({"path": str(path), "kind": kind, "name": name or path.name})
+        return candidates
+
+    def _send_attachment_candidate(self, chat_id: str, candidate: Dict[str, str]) -> bool:
+        path = Path(candidate["path"])
+        if candidate["kind"] == "image":
+            return self.api.send_image_path(chat_id, path)
+        return self.api.send_file_path(chat_id, path)
+
+    def _try_handle_attachment_send_intent(self, chat_id: str, actor_id: str, text: str) -> bool:
+        if not is_attachment_send_intent(text):
+            return False
+        candidates = self._recent_attachment_candidates(chat_id, actor_id)
+        if not candidates:
+            self.api.send_message(chat_id, "当前没有可发送的最近附件。先让我生成或提到文件路径，再发送“发给我”。")
+            return True
+        if len(candidates) > 1:
+            self.api.send_message(chat_id, "当前有多个可发送附件，下一步我会支持编号选择。")
+            return True
+        ok = self._send_attachment_candidate(chat_id, candidates[0])
+        if not ok:
+            self.api.send_message(chat_id, "附件发送失败了，请稍后再试。")
+        return True
 
     def _finalize_stream_reply(
         self,

@@ -38,6 +38,8 @@ class FakeFeishuAPI:
         self.level = "INFO"
         self.rich_message_enabled = False
         self.sent_messages = []
+        self.sent_images = []
+        self.sent_files = []
 
     def send_message(self, chat_id: str, text: str) -> bool:
         self.sent_messages.append((chat_id, text))
@@ -53,6 +55,14 @@ class FakeFeishuAPI:
 
     def patch_agent_message(self, message_id: str, text: str, title: str = "") -> bool:
         self.sent_messages.append((message_id, text, title))
+        return True
+
+    def send_image_path(self, chat_id: str, path: Path) -> bool:
+        self.sent_images.append((chat_id, str(path)))
+        return True
+
+    def send_file_path(self, chat_id: str, path: Path) -> bool:
+        self.sent_files.append((chat_id, str(path)))
         return True
 
 
@@ -429,6 +439,52 @@ class FeishuModelAccountTests(unittest.TestCase):
                 state.get_recent_attachments("chat-1::user-1"),
                 [{"path": "/tmp/old.txt", "kind": "file", "name": "old.txt"}],
             )
+
+    def test_send_intent_auto_sends_single_recent_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            image_path = root / "preview.png"
+            image_path.write_bytes(b"image-bytes")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(image_path), "kind": "image", "name": "preview.png"}],
+            )
+
+            service._handle_text("chat-1", "user-1", "发给我")
+
+            self.assertEqual(api.sent_images, [("chat-1", str(image_path))])
+            self.assertEqual(api.sent_files, [])
+            self.assertEqual(codex.calls, [])
+
+    def test_send_intent_auto_sends_single_recent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            file_path = root / "notes.txt"
+            file_path.write_text("hello", encoding="utf-8")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(file_path), "kind": "file", "name": "notes.txt"}],
+            )
+
+            service._handle_text("chat-1", "user-1", "把文件发给我")
+
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(api.sent_files, [("chat-1", str(file_path))])
+            self.assertEqual(codex.calls, [])
+
+    def test_send_intent_without_candidate_returns_helpful_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, _, codex = self.build_service(root)
+
+            service._handle_text("chat-1", "user-1", "发给我")
+
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(api.sent_files, [])
+            self.assertEqual(codex.calls, [])
+            self.assertIn("没有可发送", api.sent_messages[-1][1])
 
 
 if __name__ == "__main__":
