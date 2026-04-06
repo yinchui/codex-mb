@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import feishu_longconn_service as service_module
 from codex_common import BotState, SessionStore
 from feishu_longconn_service import FeishuAPI, FeishuCodexService
 
@@ -722,7 +723,76 @@ class FeishuModelAccountTests(unittest.TestCase):
                 service._handle_text("chat-1", "user-1", "发给我")
 
             self.assertEqual(codex.calls, [])
-            self.assertIn("没有权限读取", api.sent_messages[-1][1])
+            text = api.sent_messages[-1][1]
+            self.assertIn("飞书服务缺少系统权限", text)
+            self.assertIn("系统设置", text)
+            self.assertNotIn(str(image_path), text)
+
+    def test_send_intent_permission_shaped_oserror_returns_helpful_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            image_path = root / "preview.png"
+            image_path.write_bytes(b"image-bytes")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(image_path), "kind": "image", "name": "preview.png"}],
+            )
+
+            def _raise_os_error(_chat_id, _path):
+                raise OSError("Operation not permitted")
+
+            api.send_image_path = _raise_os_error
+
+            with patch("codex_common.Path.home", return_value=root):
+                service._handle_text("chat-1", "user-1", "发给我")
+
+            self.assertEqual(codex.calls, [])
+            text = api.sent_messages[-1][1]
+            self.assertIn("飞书服务缺少系统权限", text)
+            self.assertIn("系统设置", text)
+            self.assertNotIn("附件读取失败", text)
+            self.assertNotIn(str(image_path), text)
+
+    def test_send_intent_preflight_permission_failures_return_helpful_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            image_path = root / "preview.png"
+            image_path.write_bytes(b"image-bytes")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(image_path), "kind": "image", "name": "preview.png"}],
+            )
+
+            for method_name in ("exists", "is_file"):
+                for exc in (PermissionError("Operation not permitted"), OSError("permission denied")):
+                    with self.subTest(method_name=method_name, exc_type=type(exc).__name__):
+                        original_method = getattr(service_module.Path, method_name)
+
+                        def _raise_permission_error(path_obj, _exc=exc):
+                            if path_obj == image_path:
+                                raise _exc
+                            return original_method(path_obj)
+
+                        api.sent_messages.clear()
+                        api.sent_images.clear()
+                        api.sent_files.clear()
+                        codex.calls.clear()
+
+                        with patch(
+                            f"feishu_longconn_service.Path.{method_name}",
+                            new=_raise_permission_error,
+                        ), patch("codex_common.Path.home", return_value=root):
+                            service._handle_text("chat-1", "user-1", "发给我")
+
+                        self.assertEqual(codex.calls, [])
+                        self.assertEqual(api.sent_images, [])
+                        self.assertEqual(api.sent_files, [])
+                        text = api.sent_messages[-1][1]
+                        self.assertIn("飞书服务缺少系统权限", text)
+                        self.assertIn("系统设置", text)
+                        self.assertNotIn(str(image_path), text)
 
     def test_send_intent_with_multiple_candidates_prompts_for_number(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -812,6 +882,105 @@ class FeishuModelAccountTests(unittest.TestCase):
 
             self.assertFalse(state.is_pending_attachment_pick("chat-1::user-1"))
             mock_run_prompt.assert_called_once_with("chat-1", "user-1", "继续处理别的事")
+
+
+class FeishuStartupPermissionProbeTests(unittest.TestCase):
+    def test_probe_home_directory_permissions_marks_blocked_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home_dir = Path(tmpdir)
+            for folder in ("Desktop", "Documents", "Downloads"):
+                (home_dir / folder).mkdir(parents=True, exist_ok=True)
+
+            def _raise_permission_error(path):
+                raise PermissionError(f"Operation not permitted: {path}")
+
+            with patch("feishu_longconn_service.Path.home", return_value=home_dir), patch(
+                "feishu_longconn_service.os.scandir",
+                side_effect=_raise_permission_error,
+            ):
+                result = service_module._probe_home_directory_permissions()
+
+            self.assertEqual(result["Desktop"]["status"], "blocked")
+            self.assertEqual(result["Documents"]["status"], "blocked")
+            self.assertEqual(result["Downloads"]["status"], "blocked")
+
+    def test_probe_home_directory_permissions_marks_missing_folders_without_blocked_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home_dir = Path(tmpdir)
+
+            with patch("feishu_longconn_service.Path.home", return_value=home_dir):
+                result = service_module._probe_home_directory_permissions()
+
+            self.assertEqual(result["Desktop"]["status"], "missing")
+            self.assertEqual(result["Documents"]["status"], "missing")
+            self.assertEqual(result["Downloads"]["status"], "missing")
+            self.assertIn("FileNotFoundError", result["Desktop"]["error"])
+            self.assertIn("FileNotFoundError", result["Documents"]["error"])
+            self.assertIn("FileNotFoundError", result["Downloads"]["error"])
+
+    def test_run_forever_logs_permission_probe_result_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, _, _, _ = FeishuModelAccountTests().build_service(root)
+
+            class _FakeWsClient:
+                def __init__(self) -> None:
+                    self.started = False
+
+                def start(self) -> None:
+                    self.started = True
+
+            ws_client = _FakeWsClient()
+            service.ws_client = ws_client
+            probe_result = {
+                "Desktop": {"path": "/Users/demo/Desktop", "status": "blocked", "error": "PermissionError: denied"},
+                "Documents": {"path": "/Users/demo/Documents", "status": "readable"},
+                "Downloads": {"path": "/Users/demo/Downloads", "status": "blocked", "error": "PermissionError: denied"},
+            }
+
+            with patch(
+                "feishu_longconn_service._probe_home_directory_permissions",
+                return_value=probe_result,
+            ) as mock_probe, patch("feishu_longconn_service.log") as mock_log:
+                service.run_forever()
+
+            self.assertTrue(ws_client.started)
+            mock_probe.assert_called_once_with()
+            self.assertTrue(
+                any("folder=Desktop" in str(call) and "status=blocked" in str(call) for call in mock_log.call_args_list)
+            )
+            self.assertTrue(
+                any("folder=Documents" in str(call) and "status=readable" in str(call) for call in mock_log.call_args_list)
+            )
+            self.assertTrue(
+                any("folder=Downloads" in str(call) and "status=blocked" in str(call) for call in mock_log.call_args_list)
+            )
+
+    def test_run_forever_starts_ws_client_when_permission_probe_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, _, _, _ = FeishuModelAccountTests().build_service(root)
+
+            class _FakeWsClient:
+                def __init__(self) -> None:
+                    self.started = False
+
+                def start(self) -> None:
+                    self.started = True
+
+            ws_client = _FakeWsClient()
+            service.ws_client = ws_client
+
+            with patch(
+                "feishu_longconn_service._probe_home_directory_permissions",
+                side_effect=RuntimeError("probe exploded"),
+            ) as mock_probe, patch("feishu_longconn_service.log") as mock_log:
+                service.run_forever()
+
+            self.assertTrue(ws_client.started)
+            mock_probe.assert_called_once_with()
+            self.assertTrue(any("startup permission probe failed" in str(call) for call in mock_log.call_args_list))
+            self.assertTrue(any("probe exploded" in str(call) for call in mock_log.call_args_list))
 
 
 if __name__ == "__main__":

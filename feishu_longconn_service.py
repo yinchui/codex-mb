@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 import time
+import errno
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -38,6 +39,24 @@ from codex_common import (
 
 
 MAX_FEISHU_TEXT = 2000
+
+
+def _is_permission_shaped_os_error(exc: OSError) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM):
+        return True
+    message = str(exc).strip().lower()
+    if not message:
+        return False
+    return any(
+        token in message
+        for token in (
+            "operation not permitted",
+            "permission denied",
+            "access denied",
+        )
+    )
 
 
 def parse_allowed_open_ids(raw: Optional[str]) -> Optional[Set[str]]:
@@ -229,6 +248,38 @@ def adapt_markdown_for_feishu(markdown: str) -> Tuple[str, str]:
 
     body = "\n".join(out).strip()
     return title, body or markdown
+
+
+def _probe_home_directory_permissions() -> Dict[str, Dict[str, str]]:
+    """Probe common TCC-protected folders under home directory."""
+    home = Path.home().expanduser()
+    result: Dict[str, Dict[str, str]] = {}
+    for folder in ("Desktop", "Documents", "Downloads"):
+        target = home / folder
+        status = "readable"
+        error_message = ""
+        try:
+            # Lightweight check: touching one dir entry is enough for permission probing.
+            with os.scandir(target) as entries:
+                next(entries, None)
+        except FileNotFoundError as exc:
+            status = "missing"
+            error_message = f"{type(exc).__name__}: {exc}"
+        except PermissionError as exc:
+            status = "blocked"
+            error_message = f"{type(exc).__name__}: {exc}"
+        except OSError as exc:
+            status = "blocked" if _is_permission_shaped_os_error(exc) else "error"
+            error_message = f"{type(exc).__name__}: {exc}"
+
+        item: Dict[str, str] = {
+            "path": str(target),
+            "status": status,
+        }
+        if error_message:
+            item["error"] = error_message
+        result[folder] = item
+    return result
 
 
 class FeishuAPI:
@@ -614,6 +665,25 @@ class FeishuCodexService:
             f"stream_min_delta_chars={self.stream_min_delta_chars}, "
             f"thinking_status_interval_ms={self.thinking_status_interval_ms})"
         )
+        try:
+            probe_result = _probe_home_directory_permissions()
+        except Exception as exc:
+            log(f"startup permission probe failed: {type(exc).__name__}: {exc}")
+        else:
+            for folder, item in probe_result.items():
+                status = str(item.get("status") or "unknown")
+                path = str(item.get("path") or "")
+                error = str(item.get("error") or "").strip()
+                if error:
+                    log(
+                        "startup permission probe: "
+                        f"folder={folder} status={status} path={path} error={error}"
+                    )
+                else:
+                    log(
+                        "startup permission probe: "
+                        f"folder={folder} status={status} path={path}"
+                    )
         self.ws_client.start()
 
     def _on_ignored_event(self, data: Any) -> None:
@@ -1081,8 +1151,20 @@ class FeishuCodexService:
             path = Path(str(item.get("path") or "").strip()).expanduser()
             kind = str(item.get("kind") or "").strip()
             name = str(item.get("name") or path.name).strip()
-            if not path.is_absolute() or not path.exists() or not path.is_file():
+            if not path.is_absolute():
                 continue
+            preflight_permission_denied = False
+            try:
+                if not path.exists() or not path.is_file():
+                    continue
+            except OSError as exc:
+                if not _is_permission_shaped_os_error(exc):
+                    raise
+                preflight_permission_denied = True
+                log(
+                    "attachment preflight permission denied: "
+                    f"path={path} error={type(exc).__name__}: {exc}"
+                )
             if kind not in ("image", "file"):
                 continue
             allowed, reason = is_allowed_home_attachment_path(path)
@@ -1099,7 +1181,10 @@ class FeishuCodexService:
                     }
                 )
                 continue
-            candidates.append({"path": str(path), "kind": kind, "name": name or path.name})
+            candidate = {"path": str(path), "kind": kind, "name": name or path.name}
+            if preflight_permission_denied:
+                candidate["preflight_permission_denied"] = "1"
+            candidates.append(candidate)
         return candidates, rejected
 
     @staticmethod
@@ -1114,8 +1199,22 @@ class FeishuCodexService:
             return f"根据安全策略，不允许发送该类型文件：{name}"
         return f"根据安全策略，不允许发送该文件：{name}"
 
+    @staticmethod
+    def _attachment_permission_help_message(candidate: Dict[str, str]) -> str:
+        name = FeishuCodexService._attachment_display_name(candidate)
+        return (
+            f"飞书服务缺少系统权限，无法读取附件：{name}\n"
+            "请在系统设置中为飞书服务开启对应文件夹访问权限（如桌面/文稿/下载），"
+            "或让我重新生成到可访问目录后再发送。"
+        )
+
     def _send_attachment_candidate(self, chat_id: str, candidate: Dict[str, str]) -> Tuple[bool, Optional[str]]:
         path = Path(candidate["path"])
+        name = self._attachment_display_name(candidate)
+        permission_help_message = self._attachment_permission_help_message(candidate)
+        if str(candidate.get("preflight_permission_denied") or "").strip():
+            log(f"attachment preflight permission denied: path={path}")
+            return (False, permission_help_message)
         try:
             if candidate["kind"] == "image":
                 ok = self.api.send_image_path(chat_id, path)
@@ -1123,10 +1222,16 @@ class FeishuCodexService:
                 ok = self.api.send_file_path(chat_id, path)
         except PermissionError:
             log(f"attachment send permission denied: path={path}")
-            return False, f"没有权限读取这个附件源文件：{path}\n请让我重新生成到机器人可访问的目录后再发送。"
+            return (False, permission_help_message)
         except OSError as exc:
             log(f"attachment send failed with os error: path={path} error={exc}")
-            return False, f"附件读取失败：{path}\n请让我重新生成或换个目录后再发送。"
+            if _is_permission_shaped_os_error(exc):
+                return (False, permission_help_message)
+            return (
+                False,
+                f"附件读取失败：{name}\n"
+                "请检查文件是否仍可访问，或让我重新生成到可访问目录后再发送。",
+            )
         if not ok:
             return False, "附件发送失败了，请稍后再试。"
         return True, None
