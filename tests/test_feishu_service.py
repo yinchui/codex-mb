@@ -486,6 +486,93 @@ class FeishuModelAccountTests(unittest.TestCase):
             self.assertEqual(codex.calls, [])
             self.assertIn("没有可发送", api.sent_messages[-1][1])
 
+    def test_send_intent_with_multiple_candidates_prompts_for_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            image_path = root / "preview.png"
+            file_path = root / "notes.txt"
+            image_path.write_bytes(b"image-bytes")
+            file_path.write_text("hello", encoding="utf-8")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [
+                    {"path": str(image_path), "kind": "image", "name": "preview.png"},
+                    {"path": str(file_path), "kind": "file", "name": "notes.txt"},
+                ],
+            )
+
+            service._handle_text("chat-1", "user-1", "发给我")
+
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(api.sent_files, [])
+            self.assertEqual(codex.calls, [])
+            self.assertTrue(state.is_pending_attachment_pick("chat-1::user-1"))
+            text = api.sent_messages[-1][1]
+            self.assertIn("1. preview.png", text)
+            self.assertIn("2. notes.txt", text)
+            self.assertIn("回复编号", text)
+
+    def test_numeric_attachment_pick_sends_selected_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            image_path = root / "preview.png"
+            file_path = root / "notes.txt"
+            image_path.write_bytes(b"image-bytes")
+            file_path.write_text("hello", encoding="utf-8")
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [
+                    {"path": str(image_path), "kind": "image", "name": "preview.png"},
+                    {"path": str(file_path), "kind": "file", "name": "notes.txt"},
+                ],
+            )
+
+            service._handle_text("chat-1", "user-1", "发给我")
+            service._handle_text("chat-1", "user-1", "2")
+
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(api.sent_files, [("chat-1", str(file_path))])
+            self.assertEqual(codex.calls, [])
+            self.assertFalse(state.is_pending_attachment_pick("chat-1::user-1"))
+
+    def test_invalid_attachment_pick_returns_error_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, codex = self.build_service(root)
+            file_path = root / "notes.txt"
+            file_path.write_text("hello", encoding="utf-8")
+            state.set_attachment_picker(
+                "chat-1::user-1",
+                [{"path": str(file_path), "kind": "file", "name": "notes.txt"}],
+            )
+
+            service._handle_text("chat-1", "user-1", "9")
+
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(api.sent_files, [])
+            self.assertEqual(codex.calls, [])
+            self.assertTrue(state.is_pending_attachment_pick("chat-1::user-1"))
+            self.assertIn("附件编号无效", api.sent_messages[-1][1])
+
+    def test_unrelated_text_clears_pending_attachment_pick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, _, state, _ = self.build_service(root)
+            file_path = root / "notes.txt"
+            file_path.write_text("hello", encoding="utf-8")
+            state.set_attachment_picker(
+                "chat-1::user-1",
+                [{"path": str(file_path), "kind": "file", "name": "notes.txt"}],
+            )
+
+            with patch.object(service, "_run_prompt") as mock_run_prompt:
+                service._handle_text("chat-1", "user-1", "继续处理别的事")
+
+            self.assertFalse(state.is_pending_attachment_pick("chat-1::user-1"))
+            mock_run_prompt.assert_called_once_with("chat-1", "user-1", "继续处理别的事")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -685,19 +685,24 @@ class FeishuCodexService:
         self._handle_text(chat_id, actor_id, text)
 
     def _handle_text(self, chat_id: str, actor_id: str, text: str) -> None:
+        attachment_state_key = self._attachment_state_key(chat_id, actor_id)
         if not text.startswith("/"):
             if self._try_handle_attachment_send_intent(chat_id, actor_id, text):
+                return
+            if self._try_handle_attachment_pick(chat_id, actor_id, text):
                 return
             if self._try_handle_quick_model_pick(chat_id, actor_id, text):
                 return
             if self._try_handle_quick_session_pick(chat_id, actor_id, text):
                 return
+            self.state.clear_attachment_picker(attachment_state_key)
             self.state.clear_model_picker(actor_id)
             self.state.set_pending_session_pick(actor_id, False)
             self._run_prompt(chat_id, actor_id, text)
             return
 
         cmd, arg = self._parse_command(text)
+        self.state.clear_attachment_picker(attachment_state_key)
         if cmd != "model":
             self.state.clear_model_picker(actor_id)
         if cmd in ("start", "help"):
@@ -1048,16 +1053,56 @@ class FeishuCodexService:
         return self.api.send_file_path(chat_id, path)
 
     def _try_handle_attachment_send_intent(self, chat_id: str, actor_id: str, text: str) -> bool:
+        state_key = self._attachment_state_key(chat_id, actor_id)
         if not is_attachment_send_intent(text):
             return False
         candidates = self._recent_attachment_candidates(chat_id, actor_id)
         if not candidates:
+            self.state.clear_attachment_picker(state_key)
             self.api.send_message(chat_id, "当前没有可发送的最近附件。先让我生成或提到文件路径，再发送“发给我”。")
             return True
         if len(candidates) > 1:
-            self.api.send_message(chat_id, "当前有多个可发送附件，下一步我会支持编号选择。")
+            lines = ["找到多个最近附件，回复编号即可发送:"]
+            for idx, candidate in enumerate(candidates, start=1):
+                kind_label = "图片" if candidate["kind"] == "image" else "文件"
+                lines.append(f"{idx}. {candidate['name']} ({kind_label})")
+            self.state.clear_model_picker(actor_id)
+            self.state.set_pending_session_pick(actor_id, False)
+            self.state.set_attachment_picker(state_key, candidates)
+            self.api.send_message(chat_id, "\n".join(lines))
             return True
+        self.state.clear_attachment_picker(state_key)
         ok = self._send_attachment_candidate(chat_id, candidates[0])
+        if not ok:
+            self.api.send_message(chat_id, "附件发送失败了，请稍后再试。")
+        return True
+
+    def _try_handle_attachment_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
+        state_key = self._attachment_state_key(chat_id, actor_id)
+        if not self.state.is_pending_attachment_pick(state_key):
+            return False
+        raw = text.strip()
+        if not raw.isdigit():
+            return False
+        idx = int(raw)
+        picker = self.state.get_attachment_picker(state_key)
+        attachments = picker.get("attachments")
+        if not isinstance(attachments, list) or idx <= 0 or idx > len(attachments):
+            self.api.send_message(chat_id, "附件编号无效。请重新发送编号。")
+            return True
+        candidate = attachments[idx - 1]
+        if not isinstance(candidate, dict):
+            self.api.send_message(chat_id, "附件编号无效。请重新发送编号。")
+            return True
+        ok = self._send_attachment_candidate(
+            chat_id,
+            {
+                "path": str(candidate.get("path") or "").strip(),
+                "kind": str(candidate.get("kind") or "").strip(),
+                "name": str(candidate.get("name") or "").strip(),
+            },
+        )
+        self.state.clear_attachment_picker(state_key)
         if not ok:
             self.api.send_message(chat_id, "附件发送失败了，请稍后再试。")
         return True
