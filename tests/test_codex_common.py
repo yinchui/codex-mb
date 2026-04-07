@@ -287,6 +287,34 @@ class AttachmentHelpersTests(unittest.TestCase):
             self.assertTrue(allowed)
             self.assertIsNone(reason)
 
+    def test_is_allowed_home_attachment_path_accepts_new_supported_types_under_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            targets = [
+                home / "Desktop" / "report.docx",
+                home / "Desktop" / "sheet.xlsx",
+                home / "Desktop" / "clip.mp4",
+            ]
+
+            for target in targets:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("ok", encoding="utf-8")
+                with patch("codex_common.Path.home", return_value=home):
+                    allowed, reason = is_allowed_home_attachment_path(target)
+                self.assertTrue(allowed)
+                self.assertIsNone(reason)
+
+    def test_is_allowed_home_attachment_path_accepts_supported_file_under_volumes(self) -> None:
+        home = Path("/Users/example")
+        target = Path("/Volumes/USB/movie.mp4")
+
+        with patch("codex_common.Path.home", return_value=home):
+            with patch("pathlib.Path.resolve", autospec=True, side_effect=lambda self: self):
+                allowed, reason = is_allowed_home_attachment_path(target)
+
+        self.assertTrue(allowed)
+        self.assertIsNone(reason)
+
     def test_is_allowed_home_attachment_path_rejects_unsupported_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
@@ -351,6 +379,12 @@ class AttachmentHelpersTests(unittest.TestCase):
         self.assertEqual(
             extract_attachment_name_hints("文件Kimi_Attention_Residuals_2603.15031.pdf"),
             ["Kimi_Attention_Residuals_2603.15031.pdf"],
+        )
+
+    def test_extract_attachment_name_hints_supports_new_file_types(self) -> None:
+        self.assertEqual(
+            extract_attachment_name_hints("把demo.docx、sheet.xlsx、clip.mp4发给我"),
+            ["demo.docx", "sheet.xlsx", "clip.mp4"],
         )
 
     def test_extract_local_attachment_candidates_keeps_existing_absolute_supported_files(self) -> None:

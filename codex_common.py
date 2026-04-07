@@ -106,6 +106,9 @@ SUPPORTED_ATTACHMENT_EXTENSIONS = {
     ".md": "file",
     ".txt": "file",
     ".zip": "file",
+    ".docx": "file",
+    ".xlsx": "file",
+    ".mp4": "file",
 }
 ATTACHMENT_SEND_INTENT_PATTERNS = (
     "发给我",
@@ -141,7 +144,7 @@ COMPOUND_ATTACHMENT_ACTION_PATTERNS = (
 )
 ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9_./-])(/[^\s`<>\"'，。；;]+)")
 ATTACHMENT_HINT_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9._-])([A-Za-z0-9][A-Za-z0-9._-]*\.(?:png|jpg|jpeg|webp|pdf|md|txt|zip))(?![A-Za-z0-9._-])",
+    r"(?<![A-Za-z0-9._-])([A-Za-z0-9][A-Za-z0-9._-]*\.(?:png|jpg|jpeg|webp|pdf|md|txt|zip|docx|xlsx|mp4))(?![A-Za-z0-9._-])",
     re.IGNORECASE,
 )
 SENSITIVE_HOME_DIR_NAMES = {".ssh", ".gnupg", ".aws"}
@@ -237,9 +240,15 @@ def is_allowed_home_attachment_path(path: Path) -> Tuple[bool, Optional[str]]:
     except Exception:
         return False, "outside_home"
 
+    allowed_root = False
     try:
         resolved.relative_to(home)
+        allowed_root = True
     except ValueError:
+        parts = resolved.parts
+        if len(parts) >= 4 and len(parts[2].strip()) > 0 and parts[1].lower() == "volumes":
+            allowed_root = True
+    if not allowed_root:
         return False, "outside_home"
 
     lowered_parts = {part.lower() for part in resolved.parts}

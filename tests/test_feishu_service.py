@@ -746,6 +746,27 @@ class FeishuModelAccountTests(unittest.TestCase):
             self.assertEqual(api.sent_images, [])
             self.assertEqual(codex.calls, [])
 
+    def test_send_intent_sends_allowed_volume_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home_dir = root / "home"
+            file_path = root / "external" / "clip.mp4"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text("hello", encoding="utf-8")
+            service, api, state, codex = self.build_service(root)
+            state.set_recent_attachments(
+                "chat-1::user-1",
+                [{"path": str(file_path), "kind": "file", "name": "clip.mp4"}],
+            )
+
+            with patch("codex_common.Path.home", return_value=home_dir):
+                with patch("feishu_longconn_service.is_allowed_home_attachment_path", return_value=(True, None)):
+                    service._handle_text("chat-1", "user-1", "把这个发给我")
+
+            self.assertEqual(api.sent_files, [("chat-1", str(file_path))])
+            self.assertEqual(api.sent_images, [])
+            self.assertEqual(codex.calls, [])
+
     def test_send_intent_rejects_sensitive_candidate_without_upload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

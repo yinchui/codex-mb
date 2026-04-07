@@ -1403,7 +1403,7 @@ class FeishuCodexService:
         if reason == "sensitive_path":
             return f"根据安全策略，不允许发送敏感目录中的文件：{name}"
         if reason == "outside_home":
-            return f"根据安全策略，仅允许发送 Home 目录中的文件：{name}"
+            return f"根据安全策略，仅允许发送 Home 目录或外接硬盘中的文件：{name}"
         if reason == "unsupported_type":
             return f"根据安全策略，不允许发送该类型文件：{name}"
         return f"根据安全策略，不允许发送该文件：{name}"
