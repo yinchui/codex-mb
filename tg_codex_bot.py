@@ -661,6 +661,12 @@ class TgCodexService:
             self._handle_workspace_callback(chat_id, reply_to, int(user_id), raw_index)
             return
 
+        if data.startswith("session_pick:"):
+            raw_index = data[13:]
+            self.api.answer_callback_query(cq_id, text="正在处理选择...")
+            self._handle_session_pick_callback(chat_id, reply_to, int(user_id), raw_index)
+            return
+
         if data.startswith("use:"):
             session_id = data[4:]
             self.api.answer_callback_query(cq_id, text="正在切换会话...")
@@ -704,7 +710,7 @@ class TgCodexService:
 
     def _clear_session_pickers(self, user_id: int) -> None:
         self.state.clear_workspace_picker(user_id)
-        self.state.set_pending_session_pick(user_id, False)
+        self.state.clear_session_picker(user_id)
 
     def _handle_sessions(self, chat_id: int, reply_to: int, arg: str, user_id: int) -> None:
         limit = 10
@@ -747,13 +753,26 @@ class TgCodexService:
         session_ids = workspace.get("session_ids")
         if not isinstance(session_ids, list):
             self.state.set_last_session_ids(user_id, [])
-            self.state.set_pending_session_pick(user_id, False)
+            self.state.clear_session_picker(user_id)
             self.api.send_message(chat_id, "工作区列表已失效，请重新发送 /sessions。", reply_to=reply_to)
             return
+        cwd = str(workspace.get("cwd") or "").strip()
         label = str(workspace.get("label") or "当前工作区")
         lines = [f"最近会话（工作区: {label}）:"]
         available_session_ids: List[str] = []
         keyboard_rows: List[List[Dict[str, str]]] = []
+        picker_options: List[Dict[str, str]] = []
+        if cwd:
+            lines.append("1. 新建会话")
+            picker_options.append({"kind": "new", "cwd": cwd})
+            keyboard_rows.append(
+                [
+                    {
+                        "text": "新建会话",
+                        "callback_data": "session_pick:1",
+                    }
+                ]
+            )
         for raw_session_id in session_ids:
             session_id = str(raw_session_id or "").strip()
             if not session_id:
@@ -762,20 +781,27 @@ class TgCodexService:
             if not meta:
                 continue
             available_session_ids.append(meta.session_id)
+            picker_options.append(
+                {
+                    "kind": "session",
+                    "cwd": meta.cwd,
+                    "session_id": meta.session_id,
+                }
+            )
             short_id = meta.session_id[:8]
-            index = len(available_session_ids)
+            index = len(picker_options)
             lines.append(f"{index}. {meta.title} | {short_id}")
             keyboard_rows.append(
                 [
                     {
                         "text": f"会话 {index}",
-                        "callback_data": f"use:{meta.session_id}",
+                        "callback_data": f"session_pick:{index}",
                     }
                 ]
             )
-        if not available_session_ids:
+        if not picker_options:
             self.state.set_last_session_ids(user_id, [])
-            self.state.set_pending_session_pick(user_id, False)
+            self.state.clear_session_picker(user_id)
             self.api.send_message(chat_id, "该工作区下没有可用会话了，请重新发送 /sessions。", reply_to=reply_to)
             return
         lines.append("再发送会话编号即可切换（例如发送: 1）")
@@ -786,13 +812,19 @@ class TgCodexService:
             reply_markup={"inline_keyboard": keyboard_rows},
         )
         self.state.set_last_session_ids(user_id, available_session_ids)
-        self.state.set_pending_session_pick(user_id, True)
+        self.state.set_session_picker(user_id, picker_options)
 
     def _handle_workspace_callback(self, chat_id: int, reply_to: int, user_id: int, raw_index: str) -> None:
         if not raw_index.isdigit():
             self.api.send_message(chat_id, "工作区编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
             return
         self._open_workspace_sessions(chat_id, reply_to, user_id, int(raw_index))
+
+    def _handle_session_pick_callback(self, chat_id: int, reply_to: int, user_id: int, raw_index: str) -> None:
+        if not raw_index.isdigit():
+            self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
+            return
+        self._open_session_picker_option(chat_id, reply_to, user_id, int(raw_index))
 
     def _open_workspace_sessions(self, chat_id: int, reply_to: int, user_id: int, idx: int) -> bool:
         picker = self.state.get_workspace_picker(user_id)
@@ -802,6 +834,32 @@ class TgCodexService:
             return False
         self.state.clear_workspace_picker(user_id)
         self._show_workspace_sessions(chat_id, reply_to, user_id, workspaces[idx - 1])
+        return True
+
+    def _open_session_picker_option(self, chat_id: int, reply_to: int, user_id: int, idx: int) -> bool:
+        picker = self.state.get_session_picker(user_id)
+        options = picker.get("options")
+        if isinstance(options, list) and options:
+            if idx <= 0 or idx > len(options):
+                self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
+                return False
+            option = options[idx - 1]
+            kind = str(option.get("kind") or "").strip()
+            if kind == "new":
+                cwd = str(option.get("cwd") or "").strip()
+                self._handle_new(chat_id, reply_to, user_id, cwd)
+                return True
+            session_id = str(option.get("session_id") or "").strip()
+            if not session_id:
+                self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
+                return False
+            self._switch_to_session(chat_id, reply_to, user_id, session_id)
+            return True
+        recent_ids = self.state.get_last_session_ids(user_id)
+        if idx <= 0 or idx > len(recent_ids):
+            self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
+            return False
+        self._switch_to_session(chat_id, reply_to, user_id, recent_ids[idx - 1])
         return True
 
     def _handle_use(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
@@ -845,17 +903,7 @@ class TgCodexService:
         raw = text.strip()
         if not raw.isdigit():
             return False
-        idx = int(raw)
-        recent_ids = self.state.get_last_session_ids(user_id)
-        if idx <= 0 or idx > len(recent_ids):
-            self.api.send_message(
-                chat_id,
-                "编号无效。请发送 /sessions 重新查看列表。",
-                reply_to=reply_to,
-            )
-            return True
-        self._switch_to_session(chat_id, reply_to, user_id, recent_ids[idx - 1])
-        return True
+        return self._open_session_picker_option(chat_id, reply_to, user_id, int(raw))
 
     def _handle_model(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
         if arg.strip():

@@ -986,7 +986,7 @@ class FeishuCodexService:
 
     def _clear_session_pickers(self, actor_id: str) -> None:
         self.state.clear_workspace_picker(actor_id)
-        self.state.set_pending_session_pick(actor_id, False)
+        self.state.clear_session_picker(actor_id)
 
     def _handle_sessions(self, chat_id: str, actor_id: str, arg: str) -> None:
         limit = 10
@@ -1015,12 +1015,17 @@ class FeishuCodexService:
         session_ids = workspace.get("session_ids")
         if not isinstance(session_ids, list):
             self.state.set_last_session_ids(actor_id, [])
-            self.state.set_pending_session_pick(actor_id, False)
+            self.state.clear_session_picker(actor_id)
             self.api.send_message(chat_id, "工作区列表已失效，请重新发送 /sessions。")
             return
+        cwd = str(workspace.get("cwd") or "").strip()
         label = str(workspace.get("label") or "当前工作区")
         lines = [f"最近会话（工作区: {label}）:"]
         available_session_ids: List[str] = []
+        picker_options: List[Dict[str, str]] = []
+        if cwd:
+            lines.append("1. 新建会话")
+            picker_options.append({"kind": "new", "cwd": cwd})
         for raw_session_id in session_ids:
             session_id = str(raw_session_id or "").strip()
             if not session_id:
@@ -1029,17 +1034,24 @@ class FeishuCodexService:
             if not meta:
                 continue
             available_session_ids.append(meta.session_id)
+            picker_options.append(
+                {
+                    "kind": "session",
+                    "cwd": meta.cwd,
+                    "session_id": meta.session_id,
+                }
+            )
             short_id = meta.session_id[:8]
-            lines.append(f"{len(available_session_ids)}. {meta.title} | {short_id}")
-        if not available_session_ids:
+            lines.append(f"{len(picker_options)}. {meta.title} | {short_id}")
+        if not picker_options:
             self.state.set_last_session_ids(actor_id, [])
-            self.state.set_pending_session_pick(actor_id, False)
+            self.state.clear_session_picker(actor_id)
             self.api.send_message(chat_id, "该工作区下没有可用会话了，请重新发送 /sessions。")
             return
         lines.append("再发送会话编号即可切换（例如发送: 1）")
         self.api.send_message(chat_id, "\n".join(lines))
         self.state.set_last_session_ids(actor_id, available_session_ids)
-        self.state.set_pending_session_pick(actor_id, True)
+        self.state.set_session_picker(actor_id, picker_options)
 
     def _handle_use(self, chat_id: str, actor_id: str, arg: str) -> None:
         selector = arg.strip()
@@ -1090,6 +1102,24 @@ class FeishuCodexService:
         if not raw.isdigit():
             return False
         idx = int(raw)
+        picker = self.state.get_session_picker(actor_id)
+        options = picker.get("options")
+        if isinstance(options, list) and options:
+            if idx <= 0 or idx > len(options):
+                self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")
+                return True
+            option = options[idx - 1]
+            kind = str(option.get("kind") or "").strip()
+            if kind == "new":
+                cwd = str(option.get("cwd") or "").strip()
+                self._handle_new(chat_id, actor_id, cwd)
+                return True
+            session_id = str(option.get("session_id") or "").strip()
+            if not session_id:
+                self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")
+                return True
+            self._switch_to_session(chat_id, actor_id, session_id)
+            return True
         recent_ids = self.state.get_last_session_ids(actor_id)
         if idx <= 0 or idx > len(recent_ids):
             self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")

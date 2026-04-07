@@ -225,8 +225,10 @@ class TelegramModelAccountTests(unittest.TestCase):
             self.assertTrue(state.is_pending_session_pick(42))
             self.assertIsNone(state.get_active(42)[0])
             self.assertIn("最近会话", api.sent_messages[-1]["text"])
+            self.assertIn("1. 新建会话", api.sent_messages[-1]["text"])
+            self.assertIn("2. first prompt", api.sent_messages[-1]["text"])
 
-            service._handle_update(self.make_text_update("1", message_id=4))
+            service._handle_update(self.make_text_update("2", message_id=4))
 
             self.assertEqual(state.get_active(42)[0], "sess-1")
             self.assertIsNone(state.get_selected_model(42))
@@ -251,14 +253,33 @@ class TelegramModelAccountTests(unittest.TestCase):
             self.assertTrue(state.is_pending_session_pick(42))
             self.assertIsNone(state.get_active(42)[0])
             self.assertIn("最近会话", second_message["text"])
+            self.assertIn("1. 新建会话", second_message["text"])
             self.assertEqual(
                 second_message["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
-                "use:sess-1",
+                "session_pick:1",
+            )
+            self.assertEqual(
+                second_message["reply_markup"]["inline_keyboard"][1][0]["callback_data"],
+                "session_pick:2",
             )
 
-            service._handle_update(self.make_callback_update("use:sess-1", message_id=901, callback_id="cb-2"))
+            service._handle_update(self.make_callback_update("session_pick:2", message_id=901, callback_id="cb-2"))
 
             self.assertEqual(state.get_active(42)[0], "sess-1")
+
+    def test_workspace_callback_can_enter_new_session_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, _, state, _ = self.build_service(root)
+
+            service._handle_update(self.make_text_update("/sessions"))
+            service._handle_update(self.make_callback_update("workspace:1"))
+            service._handle_update(self.make_callback_update("session_pick:1", message_id=901, callback_id="cb-2"))
+
+            active_id, active_cwd = state.get_active(42)
+            self.assertIsNone(active_id)
+            self.assertEqual(active_cwd, str(root))
+            self.assertFalse(state.is_pending_session_pick(42))
 
     def test_account_command_formats_quota_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

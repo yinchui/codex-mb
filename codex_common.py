@@ -544,6 +544,57 @@ class BotState:
             user_data = self._get_user_unlocked(user_id)
             return bool(user_data.get("pending_session_pick"))
 
+    def set_session_picker(self, user_id: StateActor, options: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            normalized: List[Dict[str, str]] = []
+            for item in options:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind") or "").strip().lower()
+                cwd = str(item.get("cwd") or "").strip()
+                session_id = self._normalize_session_id(item.get("session_id"))
+                if kind == "new":
+                    if not cwd:
+                        continue
+                    normalized.append(
+                        {
+                            "kind": "new",
+                            "cwd": cwd,
+                        }
+                    )
+                    continue
+                if kind == "session":
+                    if not cwd or not session_id:
+                        continue
+                    normalized.append(
+                        {
+                            "kind": "session",
+                            "cwd": cwd,
+                            "session_id": session_id,
+                        }
+                    )
+            if normalized:
+                user_data["pending_session_pick"] = True
+                user_data["session_picker"] = {"options": normalized}
+            else:
+                user_data["pending_session_pick"] = False
+                user_data.pop("session_picker", None)
+            self._save_unlocked()
+
+    def get_session_picker(self, user_id: StateActor) -> Dict[str, Any]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            picker = user_data.get("session_picker")
+            return dict(picker) if isinstance(picker, dict) else {}
+
+    def clear_session_picker(self, user_id: StateActor) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["pending_session_pick"] = False
+            user_data.pop("session_picker", None)
+            self._save_unlocked()
+
     def set_workspace_picker(self, user_id: StateActor, workspaces: List[Dict[str, Any]]) -> None:
         with self._lock:
             user_data = self._get_user_unlocked(user_id)

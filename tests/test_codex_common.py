@@ -187,6 +187,48 @@ class BotStateModelTests(unittest.TestCase):
             self.assertFalse(state.is_pending_workspace_pick("user-1"))
             self.assertEqual(state.get_workspace_picker("user-1"), {})
 
+    def test_bot_state_tracks_pending_session_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+
+            state.set_session_picker(
+                "user-1",
+                [
+                    {
+                        "kind": "new",
+                        "cwd": "/tmp/workspace-a",
+                    },
+                    {
+                        "kind": "session",
+                        "cwd": "/tmp/workspace-a",
+                        "session_id": "sess-1",
+                    },
+                ],
+            )
+
+            self.assertTrue(state.is_pending_session_pick("user-1"))
+            self.assertEqual(
+                state.get_session_picker("user-1"),
+                {
+                    "options": [
+                        {
+                            "kind": "new",
+                            "cwd": "/tmp/workspace-a",
+                        },
+                        {
+                            "kind": "session",
+                            "cwd": "/tmp/workspace-a",
+                            "session_id": "sess-1",
+                        },
+                    ]
+                },
+            )
+
+            state.clear_session_picker("user-1")
+
+            self.assertFalse(state.is_pending_session_pick("user-1"))
+            self.assertEqual(state.get_session_picker("user-1"), {})
+
 
 class SessionGroupingTests(unittest.TestCase):
     def test_group_sessions_by_workspace_preserves_recent_group_order(self) -> None:

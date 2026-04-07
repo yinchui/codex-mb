@@ -428,11 +428,31 @@ class FeishuModelAccountTests(unittest.TestCase):
             self.assertTrue(state.is_pending_session_pick("user-1"))
             self.assertIsNone(state.get_active("user-1")[0])
             self.assertIn("最近会话", api.sent_messages[-1][1])
+            self.assertIn("1. 新建会话", api.sent_messages[-1][1])
+            self.assertIn("2. first prompt", api.sent_messages[-1][1])
 
-            service._handle_text("chat-1", "user-1", "1")
+            service._handle_text("chat-1", "user-1", "2")
 
             self.assertEqual(state.get_active("user-1")[0], "sess-1")
             self.assertIsNone(state.get_selected_model("user-1"))
+
+    def test_workspace_picker_can_enter_new_session_mode_for_selected_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            service, api, state, _ = self.build_service(root)
+
+            service._handle_text("chat-1", "user-1", "/sessions")
+            service._handle_text("chat-1", "user-1", "1")
+
+            self.assertIn("1. 新建会话", api.sent_messages[-1][1])
+
+            service._handle_text("chat-1", "user-1", "1")
+
+            active_id, active_cwd = state.get_active("user-1")
+            self.assertIsNone(active_id)
+            self.assertEqual(active_cwd, str(root))
+            self.assertFalse(state.is_pending_session_pick("user-1"))
+            self.assertIn("已进入新会话模式", api.sent_messages[-1][1])
 
     def test_account_command_formats_quota_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
