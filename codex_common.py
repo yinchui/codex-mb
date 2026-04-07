@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
+import errno
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -93,6 +95,187 @@ StateActor = Union[int, str]
 
 class ProviderLookupError(RuntimeError):
     pass
+
+
+SUPPORTED_ATTACHMENT_EXTENSIONS = {
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".webp": "image",
+    ".pdf": "file",
+    ".md": "file",
+    ".txt": "file",
+    ".zip": "file",
+    ".docx": "file",
+    ".xlsx": "file",
+    ".mp4": "file",
+}
+ATTACHMENT_SEND_INTENT_PATTERNS = (
+    "发给我",
+    "把图片发我",
+    "把文件发来",
+    "作为附件发送",
+)
+COMPOUND_ATTACHMENT_ACTION_PATTERNS = (
+    "压缩成",
+    "压缩一下",
+    "打包成",
+    "打包一下",
+    "归档成",
+    "归档一下",
+    "生成一",
+    "生成个",
+    "生成份",
+    "生成张",
+    "生成后",
+    "导出一",
+    "导出个",
+    "导出份",
+    "导出后",
+    "保存成",
+    "保存到",
+    "保存后",
+    "整理成",
+    "整理后",
+    "整理一下",
+    "截个图",
+    "截一张图",
+    "截张图",
+)
+ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9_./-])(/[^\s`<>\"'，。；;]+)")
+ATTACHMENT_HINT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._-])([A-Za-z0-9][A-Za-z0-9._-]*\.(?:png|jpg|jpeg|webp|pdf|md|txt|zip|docx|xlsx|mp4))(?![A-Za-z0-9._-])",
+    re.IGNORECASE,
+)
+SENSITIVE_HOME_DIR_NAMES = {".ssh", ".gnupg", ".aws"}
+SENSITIVE_PATH_TOKENS = (
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "keychain",
+    "private_key",
+    "secret",
+    "token",
+    "credential",
+)
+
+
+def _is_permission_shaped_os_error(exc: OSError) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM):
+        return True
+    message = str(exc).strip().lower()
+    if not message:
+        return False
+    return any(
+        token in message
+        for token in (
+            "operation not permitted",
+            "permission denied",
+            "access denied",
+        )
+    )
+
+
+def extract_local_attachment_candidates(text: str) -> List[Dict[str, str]]:
+    value = str(text or "")
+    candidates: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    for raw_match in ABSOLUTE_PATH_PATTERN.findall(value):
+        raw_path = raw_match.rstrip(".,，。；;:)]}!?")
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            continue
+        ext = path.suffix.lower()
+        kind = SUPPORTED_ATTACHMENT_EXTENSIONS.get(ext)
+        if not kind:
+            continue
+        try:
+            exists = path.exists()
+            is_file = path.is_file() if exists else False
+        except OSError as exc:
+            if _is_permission_shaped_os_error(exc):
+                continue
+            raise
+        if not exists or not is_file:
+            continue
+        normalized = str(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        candidates.append(
+            {
+                "path": normalized,
+                "kind": kind,
+                "name": path.name,
+            }
+        )
+    return candidates
+
+
+def is_attachment_send_intent(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    return any(token in value for token in ATTACHMENT_SEND_INTENT_PATTERNS)
+
+
+def is_compound_attachment_send_intent(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value or not is_attachment_send_intent(value):
+        return False
+    return any(token in value for token in COMPOUND_ATTACHMENT_ACTION_PATTERNS)
+
+
+def is_allowed_home_attachment_path(path: Path) -> Tuple[bool, Optional[str]]:
+    candidate = Path(path).expanduser()
+    ext = candidate.suffix.lower()
+    if ext not in SUPPORTED_ATTACHMENT_EXTENSIONS:
+        return False, "unsupported_type"
+
+    home = Path.home().expanduser().resolve()
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        return False, "outside_home"
+
+    allowed_root = False
+    try:
+        resolved.relative_to(home)
+        allowed_root = True
+    except ValueError:
+        parts = resolved.parts
+        if len(parts) >= 4 and len(parts[2].strip()) > 0 and parts[1].lower() == "volumes":
+            allowed_root = True
+    if not allowed_root:
+        return False, "outside_home"
+
+    lowered_parts = {part.lower() for part in resolved.parts}
+    if SENSITIVE_HOME_DIR_NAMES & lowered_parts:
+        return False, "sensitive_path"
+
+    lowered_path = str(resolved).lower()
+    if any(token in lowered_path for token in SENSITIVE_PATH_TOKENS):
+        return False, "sensitive_path"
+
+    return True, None
+
+
+def extract_attachment_name_hints(text: str) -> List[str]:
+    value = str(text or "")
+    names: List[str] = []
+    seen: Set[str] = set()
+    for match in ATTACHMENT_HINT_PATTERN.findall(value):
+        name = str(match or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
 
 
 class SessionStore:
@@ -248,6 +431,29 @@ class SessionStore:
         return one_line[: limit - 1] + "…"
 
 
+def workspace_label_for_cwd(cwd: str) -> str:
+    value = str(cwd or "").strip() or "unknown"
+    return Path(value).name or value
+
+
+def group_sessions_by_workspace(items: List[SessionMeta]) -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = []
+    index_by_cwd: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        cwd = str(item.cwd or "").strip() or "unknown"
+        group = index_by_cwd.get(cwd)
+        if group is None:
+            group = {
+                "cwd": cwd,
+                "label": workspace_label_for_cwd(cwd),
+                "session_ids": [],
+            }
+            index_by_cwd[cwd] = group
+            groups.append(group)
+        group["session_ids"].append(item.session_id)
+    return groups
+
+
 class BotState:
     def __init__(self, path: Path):
         self.path = path
@@ -347,6 +553,105 @@ class BotState:
             user_data = self._get_user_unlocked(user_id)
             return bool(user_data.get("pending_session_pick"))
 
+    def set_session_picker(self, user_id: StateActor, options: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            normalized: List[Dict[str, str]] = []
+            for item in options:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind") or "").strip().lower()
+                cwd = str(item.get("cwd") or "").strip()
+                session_id = self._normalize_session_id(item.get("session_id"))
+                if kind == "new":
+                    if not cwd:
+                        continue
+                    normalized.append(
+                        {
+                            "kind": "new",
+                            "cwd": cwd,
+                        }
+                    )
+                    continue
+                if kind == "session":
+                    if not cwd or not session_id:
+                        continue
+                    normalized.append(
+                        {
+                            "kind": "session",
+                            "cwd": cwd,
+                            "session_id": session_id,
+                        }
+                    )
+            if normalized:
+                user_data["pending_session_pick"] = True
+                user_data["session_picker"] = {"options": normalized}
+            else:
+                user_data["pending_session_pick"] = False
+                user_data.pop("session_picker", None)
+            self._save_unlocked()
+
+    def get_session_picker(self, user_id: StateActor) -> Dict[str, Any]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            picker = user_data.get("session_picker")
+            return dict(picker) if isinstance(picker, dict) else {}
+
+    def clear_session_picker(self, user_id: StateActor) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["pending_session_pick"] = False
+            user_data.pop("session_picker", None)
+            self._save_unlocked()
+
+    def set_workspace_picker(self, user_id: StateActor, workspaces: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            normalized: List[Dict[str, Any]] = []
+            for item in workspaces:
+                if not isinstance(item, dict):
+                    continue
+                cwd = str(item.get("cwd") or "").strip() or "unknown"
+                label = str(item.get("label") or "").strip() or workspace_label_for_cwd(cwd)
+                raw_ids = item.get("session_ids")
+                if not isinstance(raw_ids, list):
+                    continue
+                session_ids = [str(session_id).strip() for session_id in raw_ids if str(session_id).strip()]
+                if not session_ids:
+                    continue
+                normalized.append(
+                    {
+                        "cwd": cwd,
+                        "label": label,
+                        "session_ids": session_ids,
+                    }
+                )
+            if normalized:
+                user_data["pending_workspace_pick"] = True
+                user_data["workspace_picker"] = {"workspaces": normalized}
+            else:
+                user_data["pending_workspace_pick"] = False
+                user_data.pop("workspace_picker", None)
+            self._save_unlocked()
+
+    def is_pending_workspace_pick(self, user_id: StateActor) -> bool:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            return bool(user_data.get("pending_workspace_pick"))
+
+    def get_workspace_picker(self, user_id: StateActor) -> Dict[str, Any]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            picker = user_data.get("workspace_picker")
+            return dict(picker) if isinstance(picker, dict) else {}
+
+    def clear_workspace_picker(self, user_id: StateActor) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["pending_workspace_pick"] = False
+            user_data.pop("workspace_picker", None)
+            self._save_unlocked()
+
     def update_active_session_if_unchanged(
         self,
         user_id: StateActor,
@@ -389,6 +694,85 @@ class BotState:
             user_data = self._get_user_unlocked(user_id)
             user_data["pending_model_pick"] = False
             user_data.pop("model_picker", None)
+            self._save_unlocked()
+
+    def set_recent_attachments(self, user_id: StateActor, attachments: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            normalized: List[Dict[str, str]] = []
+            for item in attachments:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "").strip()
+                kind = str(item.get("kind") or "").strip()
+                name = str(item.get("name") or "").strip()
+                if not path or not kind or not name:
+                    continue
+                normalized.append(
+                    {
+                        "path": path,
+                        "kind": kind,
+                        "name": name,
+                    }
+                )
+            user_data["recent_attachments"] = normalized
+            self._save_unlocked()
+
+    def get_recent_attachments(self, user_id: StateActor) -> List[Dict[str, str]]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            values = user_data.get("recent_attachments")
+            if not isinstance(values, list):
+                return []
+            result: List[Dict[str, str]] = []
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "").strip()
+                kind = str(item.get("kind") or "").strip()
+                name = str(item.get("name") or "").strip()
+                if not path or not kind or not name:
+                    continue
+                result.append({"path": path, "kind": kind, "name": name})
+            return result
+
+    def set_attachment_picker(self, user_id: StateActor, attachments: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            normalized: List[Dict[str, str]] = []
+            for item in attachments:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "").strip()
+                kind = str(item.get("kind") or "").strip()
+                name = str(item.get("name") or "").strip()
+                if not path or not kind or not name:
+                    continue
+                normalized.append({"path": path, "kind": kind, "name": name})
+            if normalized:
+                user_data["pending_attachment_pick"] = True
+                user_data["attachment_picker"] = {"attachments": normalized}
+            else:
+                user_data["pending_attachment_pick"] = False
+                user_data.pop("attachment_picker", None)
+            self._save_unlocked()
+
+    def is_pending_attachment_pick(self, user_id: StateActor) -> bool:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            return bool(user_data.get("pending_attachment_pick"))
+
+    def get_attachment_picker(self, user_id: StateActor) -> Dict[str, Any]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            picker = user_data.get("attachment_picker")
+            return dict(picker) if isinstance(picker, dict) else {}
+
+    def clear_attachment_picker(self, user_id: StateActor) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["pending_attachment_pick"] = False
+            user_data.pop("attachment_picker", None)
             self._save_unlocked()
 
 

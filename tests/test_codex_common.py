@@ -9,7 +9,14 @@ from codex_common import (
     BotState,
     CodexRunner,
     ProviderLookupError,
+    SessionMeta,
+    extract_attachment_name_hints,
+    extract_local_attachment_candidates,
     fetch_provider_account_info,
+    group_sessions_by_workspace,
+    is_allowed_home_attachment_path,
+    is_attachment_send_intent,
+    is_compound_attachment_send_intent,
     list_provider_models,
     load_codex_api_key,
     load_codex_base_url,
@@ -145,6 +152,377 @@ class BotStateModelTests(unittest.TestCase):
 
             self.assertFalse(state.is_pending_model_pick("user-1"))
             self.assertEqual(state.get_model_picker("user-1"), {})
+
+    def test_bot_state_tracks_pending_workspace_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+
+            state.set_workspace_picker(
+                "user-1",
+                [
+                    {
+                        "cwd": "/tmp/workspace-a",
+                        "label": "workspace-a",
+                        "session_ids": ["sess-1", "sess-2"],
+                    }
+                ],
+            )
+
+            self.assertTrue(state.is_pending_workspace_pick("user-1"))
+            self.assertEqual(
+                state.get_workspace_picker("user-1"),
+                {
+                    "workspaces": [
+                        {
+                            "cwd": "/tmp/workspace-a",
+                            "label": "workspace-a",
+                            "session_ids": ["sess-1", "sess-2"],
+                        }
+                    ]
+                },
+            )
+
+            state.clear_workspace_picker("user-1")
+
+            self.assertFalse(state.is_pending_workspace_pick("user-1"))
+            self.assertEqual(state.get_workspace_picker("user-1"), {})
+
+    def test_bot_state_tracks_pending_session_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+
+            state.set_session_picker(
+                "user-1",
+                [
+                    {
+                        "kind": "new",
+                        "cwd": "/tmp/workspace-a",
+                    },
+                    {
+                        "kind": "session",
+                        "cwd": "/tmp/workspace-a",
+                        "session_id": "sess-1",
+                    },
+                ],
+            )
+
+            self.assertTrue(state.is_pending_session_pick("user-1"))
+            self.assertEqual(
+                state.get_session_picker("user-1"),
+                {
+                    "options": [
+                        {
+                            "kind": "new",
+                            "cwd": "/tmp/workspace-a",
+                        },
+                        {
+                            "kind": "session",
+                            "cwd": "/tmp/workspace-a",
+                            "session_id": "sess-1",
+                        },
+                    ]
+                },
+            )
+
+            state.clear_session_picker("user-1")
+
+            self.assertFalse(state.is_pending_session_pick("user-1"))
+            self.assertEqual(state.get_session_picker("user-1"), {})
+
+
+class SessionGroupingTests(unittest.TestCase):
+    def test_group_sessions_by_workspace_preserves_recent_group_order(self) -> None:
+        items = [
+            SessionMeta(
+                session_id="sess-1",
+                timestamp="2026-04-06T10:00:00Z",
+                cwd="/tmp/workspace-a",
+                file_path="/tmp/sess-1.jsonl",
+                title="first prompt",
+            ),
+            SessionMeta(
+                session_id="sess-2",
+                timestamp="2026-04-06T09:00:00Z",
+                cwd="/tmp/workspace-b",
+                file_path="/tmp/sess-2.jsonl",
+                title="second prompt",
+            ),
+            SessionMeta(
+                session_id="sess-3",
+                timestamp="2026-04-06T08:00:00Z",
+                cwd="/tmp/workspace-a",
+                file_path="/tmp/sess-3.jsonl",
+                title="third prompt",
+            ),
+        ]
+
+        self.assertEqual(
+            group_sessions_by_workspace(items),
+            [
+                {
+                    "cwd": "/tmp/workspace-a",
+                    "label": "workspace-a",
+                    "session_ids": ["sess-1", "sess-3"],
+                },
+                {
+                    "cwd": "/tmp/workspace-b",
+                    "label": "workspace-b",
+                    "session_ids": ["sess-2"],
+                },
+            ],
+        )
+
+
+class AttachmentHelpersTests(unittest.TestCase):
+    def test_is_allowed_home_attachment_path_accepts_supported_file_under_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / "Desktop" / "paper.pdf"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("ok", encoding="utf-8")
+
+            with patch("codex_common.Path.home", return_value=home):
+                allowed, reason = is_allowed_home_attachment_path(target)
+
+            self.assertTrue(allowed)
+            self.assertIsNone(reason)
+
+    def test_is_allowed_home_attachment_path_accepts_new_supported_types_under_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            targets = [
+                home / "Desktop" / "report.docx",
+                home / "Desktop" / "sheet.xlsx",
+                home / "Desktop" / "clip.mp4",
+            ]
+
+            for target in targets:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("ok", encoding="utf-8")
+                with patch("codex_common.Path.home", return_value=home):
+                    allowed, reason = is_allowed_home_attachment_path(target)
+                self.assertTrue(allowed)
+                self.assertIsNone(reason)
+
+    def test_is_allowed_home_attachment_path_accepts_supported_file_under_volumes(self) -> None:
+        home = Path("/Users/example")
+        target = Path("/Volumes/USB/movie.mp4")
+
+        with patch("codex_common.Path.home", return_value=home):
+            with patch("pathlib.Path.resolve", autospec=True, side_effect=lambda self: self):
+                allowed, reason = is_allowed_home_attachment_path(target)
+
+        self.assertTrue(allowed)
+        self.assertIsNone(reason)
+
+    def test_is_allowed_home_attachment_path_rejects_unsupported_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / "Desktop" / "archive.bin"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("no", encoding="utf-8")
+
+            with patch("codex_common.Path.home", return_value=home):
+                allowed, reason = is_allowed_home_attachment_path(target)
+
+            self.assertFalse(allowed)
+            self.assertEqual(reason, "unsupported_type")
+
+    def test_is_allowed_home_attachment_path_rejects_outside_home(self) -> None:
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as outside_dir:
+            home = Path(home_dir)
+            target = Path(outside_dir) / "a.pdf"
+            target.write_text("x", encoding="utf-8")
+
+            with patch("codex_common.Path.home", return_value=home):
+                allowed, reason = is_allowed_home_attachment_path(target)
+
+            self.assertFalse(allowed)
+            self.assertEqual(reason, "outside_home")
+
+    def test_is_allowed_home_attachment_path_rejects_sensitive_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            samples = [
+                home / ".ssh" / "config.txt",
+                home / ".gnupg" / "a.txt",
+                home / ".aws" / "credentials.txt",
+                home / "Desktop" / ".env.txt",
+                home / "Desktop" / "id_rsa.txt",
+                home / "Desktop" / "id_ed25519.md",
+                home / "Desktop" / "keychain.txt",
+                home / "Desktop" / "private_key.txt",
+                home / "Desktop" / "secret_notes.txt",
+                home / "Desktop" / "token_store.txt",
+                home / "Desktop" / "credential_dump.txt",
+            ]
+            for path in samples:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x", encoding="utf-8")
+                with patch("codex_common.Path.home", return_value=home):
+                    allowed, reason = is_allowed_home_attachment_path(path)
+                self.assertFalse(allowed)
+                self.assertEqual(reason, "sensitive_path")
+
+    def test_extract_attachment_name_hints_finds_supported_file_names(self) -> None:
+        text = "Kimi_Attention_Residuals_2603.15031.pdf，把这个发给我"
+        self.assertEqual(
+            extract_attachment_name_hints(text),
+            ["Kimi_Attention_Residuals_2603.15031.pdf"],
+        )
+
+    def test_extract_attachment_name_hints_matches_when_adjacent_to_chinese_text(self) -> None:
+        self.assertEqual(
+            extract_attachment_name_hints("把Kimi_Attention_Residuals_2603.15031.pdf发给我"),
+            ["Kimi_Attention_Residuals_2603.15031.pdf"],
+        )
+        self.assertEqual(
+            extract_attachment_name_hints("文件Kimi_Attention_Residuals_2603.15031.pdf"),
+            ["Kimi_Attention_Residuals_2603.15031.pdf"],
+        )
+
+    def test_extract_attachment_name_hints_supports_new_file_types(self) -> None:
+        self.assertEqual(
+            extract_attachment_name_hints("把demo.docx、sheet.xlsx、clip.mp4发给我"),
+            ["demo.docx", "sheet.xlsx", "clip.mp4"],
+        )
+
+    def test_extract_local_attachment_candidates_keeps_existing_absolute_supported_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "screen.png"
+            note_path = root / "notes.md"
+            unsupported_path = root / "raw.bin"
+            relative_path = Path("local.txt")
+            missing_path = root / "missing.pdf"
+
+            image_path.write_text("png", encoding="utf-8")
+            note_path.write_text("hello", encoding="utf-8")
+            unsupported_path.write_text("bin", encoding="utf-8")
+            (root / relative_path).write_text("rel", encoding="utf-8")
+
+            text = "\n".join(
+                [
+                    f"image: {image_path}",
+                    f"note: `{note_path}`",
+                    f"unsupported: {unsupported_path}",
+                    f"relative: {relative_path}",
+                    f"missing: {missing_path}",
+                ]
+            )
+
+            candidates = extract_local_attachment_candidates(text)
+
+            self.assertEqual(
+                candidates,
+                [
+                    {"path": str(image_path), "kind": "image", "name": "screen.png"},
+                    {"path": str(note_path), "kind": "file", "name": "notes.md"},
+                ],
+            )
+
+    def test_is_attachment_send_intent_matches_explicit_phrases(self) -> None:
+        self.assertTrue(is_attachment_send_intent("发给我"))
+        self.assertTrue(is_attachment_send_intent("把图片发我"))
+        self.assertTrue(is_attachment_send_intent("把文件发来"))
+        self.assertTrue(is_attachment_send_intent("作为附件发送"))
+        self.assertFalse(is_attachment_send_intent("你好，今天天气怎么样"))
+
+    def test_is_compound_attachment_send_intent_matches_action_plus_send_phrase(self) -> None:
+        self.assertTrue(is_compound_attachment_send_intent("把这个文件夹压缩成压缩包然后发给我"))
+        self.assertTrue(is_compound_attachment_send_intent("生成一张图再发给我"))
+
+    def test_is_compound_attachment_send_intent_ignores_plain_send_phrase(self) -> None:
+        self.assertFalse(is_compound_attachment_send_intent("发给我"))
+        self.assertFalse(is_compound_attachment_send_intent("report.pdf，把这个发给我"))
+        self.assertFalse(is_compound_attachment_send_intent("把压缩包发给我"))
+
+    def test_extract_local_attachment_candidates_deduplicates_same_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "same.png"
+            image_path.write_text("png", encoding="utf-8")
+            text = f"{image_path}\nagain: `{image_path}`"
+
+            candidates = extract_local_attachment_candidates(text)
+
+            self.assertEqual(
+                candidates,
+                [{"path": str(image_path), "kind": "image", "name": "same.png"}],
+            )
+
+    def test_extract_local_attachment_candidates_accepts_trailing_colon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "shot.png"
+            image_path.write_text("png", encoding="utf-8")
+
+            candidates = extract_local_attachment_candidates(f"path: {image_path}:")
+
+            self.assertEqual(
+                candidates,
+                [{"path": str(image_path), "kind": "image", "name": "shot.png"}],
+            )
+
+    def test_extract_local_attachment_candidates_skips_permission_denied_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            readable_path = root / "readable.png"
+            readable_path.write_text("png", encoding="utf-8")
+            blocked_path = Path("/private/var/tcc-blocked.png")
+            original_exists = Path.exists
+
+            def _exists_with_permission_denied(path_obj):
+                if path_obj == blocked_path:
+                    raise OSError("Operation not permitted")
+                return original_exists(path_obj)
+
+            text = "\n".join([f"blocked: {blocked_path}", f"readable: {readable_path}"])
+
+            with patch("codex_common.Path.exists", new=_exists_with_permission_denied):
+                candidates = extract_local_attachment_candidates(text)
+
+            self.assertEqual(
+                candidates,
+                [{"path": str(readable_path), "kind": "image", "name": "readable.png"}],
+            )
+
+    def test_bot_state_persists_recent_attachments_and_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+            key = "chat-1::user-1"
+            attachments = [
+                {"path": "/Users/aa/Desktop/a.png", "kind": "image", "name": "a.png"},
+                {"path": "/Users/aa/Desktop/b.pdf", "kind": "file", "name": "b.pdf"},
+            ]
+
+            state.set_recent_attachments(key, attachments)
+            state.set_attachment_picker(key, attachments)
+
+            self.assertEqual(state.get_recent_attachments(key), attachments)
+            self.assertTrue(state.is_pending_attachment_pick(key))
+            self.assertEqual(state.get_attachment_picker(key).get("attachments"), attachments)
+
+            state.clear_attachment_picker(key)
+
+            self.assertFalse(state.is_pending_attachment_pick(key))
+            self.assertEqual(state.get_attachment_picker(key), {})
+
+    def test_bot_state_empty_attachment_picker_does_not_set_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "state.json")
+            key = "chat-1::user-2"
+
+            state.set_attachment_picker(
+                key,
+                [
+                    {},
+                    {"path": "", "kind": "image", "name": "bad.png"},
+                ],
+            )
+
+            self.assertFalse(state.is_pending_attachment_pick(key))
+            self.assertEqual(state.get_attachment_picker(key), {})
 
 
 class _FakePipe:

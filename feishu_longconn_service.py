@@ -3,8 +3,10 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
+import errno
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -23,7 +25,13 @@ from codex_common import (
     SessionStore,
     chunk_text,
     env,
+    extract_attachment_name_hints,
+    extract_local_attachment_candidates,
     fetch_provider_account_info,
+    group_sessions_by_workspace,
+    is_attachment_send_intent,
+    is_allowed_home_attachment_path,
+    is_compound_attachment_send_intent,
     list_provider_models,
     load_codex_default_model,
     log,
@@ -34,6 +42,39 @@ from codex_common import (
 
 
 MAX_FEISHU_TEXT = 2000
+FEISHU_MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
+FEISHU_FILE_PART_SIZE_BYTES = 29 * 1024 * 1024
+
+
+def _is_permission_shaped_os_error(exc: OSError) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM):
+        return True
+    message = str(exc).strip().lower()
+    if not message:
+        return False
+    return any(
+        token in message
+        for token in (
+            "operation not permitted",
+            "permission denied",
+            "access denied",
+        )
+    )
+
+
+def _format_file_size_mb(size_bytes: int) -> str:
+    if size_bytes <= 0:
+        return "0MB"
+    value = size_bytes / (1024 * 1024)
+    if value >= 10:
+        return f"{value:.1f}MB"
+    return f"{value:.2f}MB"
+
+
+def _part_suffix_width(total_parts: int) -> int:
+    return max(2, len(str(max(1, total_parts))))
 
 
 def parse_allowed_open_ids(raw: Optional[str]) -> Optional[Set[str]]:
@@ -227,6 +268,38 @@ def adapt_markdown_for_feishu(markdown: str) -> Tuple[str, str]:
     return title, body or markdown
 
 
+def _probe_home_directory_permissions() -> Dict[str, Dict[str, str]]:
+    """Probe common TCC-protected folders under home directory."""
+    home = Path.home().expanduser()
+    result: Dict[str, Dict[str, str]] = {}
+    for folder in ("Desktop", "Documents", "Downloads"):
+        target = home / folder
+        status = "readable"
+        error_message = ""
+        try:
+            # Lightweight check: touching one dir entry is enough for permission probing.
+            with os.scandir(target) as entries:
+                next(entries, None)
+        except FileNotFoundError as exc:
+            status = "missing"
+            error_message = f"{type(exc).__name__}: {exc}"
+        except PermissionError as exc:
+            status = "blocked"
+            error_message = f"{type(exc).__name__}: {exc}"
+        except OSError as exc:
+            status = "blocked" if _is_permission_shaped_os_error(exc) else "error"
+            error_message = f"{type(exc).__name__}: {exc}"
+
+        item: Dict[str, str] = {
+            "path": str(target),
+            "status": status,
+        }
+        if error_message:
+            item["error"] = error_message
+        result[folder] = item
+    return result
+
+
 class FeishuAPI:
     def __init__(
         self,
@@ -245,6 +318,18 @@ class FeishuAPI:
         )
         self.level = level
         self.rich_message_enabled = rich_message_enabled
+        self._last_attachment_error: Optional[str] = None
+
+    def _clear_last_attachment_error(self) -> None:
+        self._last_attachment_error = None
+
+    def _set_last_attachment_error(self, message: str) -> None:
+        self._last_attachment_error = (message or "").strip() or None
+
+    def consume_last_attachment_error(self) -> Optional[str]:
+        message = getattr(self, "_last_attachment_error", None)
+        self._last_attachment_error = None
+        return message
 
     def send_message(self, chat_id: str, text: str) -> bool:
         ok = True
@@ -307,6 +392,159 @@ class FeishuAPI:
             ok = ok and sent
         return ok
 
+    def send_image_path(self, chat_id: str, path: Path) -> bool:
+        self._clear_last_attachment_error()
+        file_path = path.expanduser()
+        if not file_path.exists() or not file_path.is_file():
+            log(f"image send skipped: invalid path {file_path}")
+            return False
+        with file_path.open("rb") as f:
+            upload_request = (
+                lark.im.v1.CreateImageRequest.builder()
+                .request_body(
+                    lark.im.v1.CreateImageRequestBody.builder()
+                    .image_type("message")
+                    .image(f)
+                    .build()
+                )
+                .build()
+            )
+            try:
+                upload_response = self.client.im.v1.image.create(upload_request)
+            except Exception as exc:
+                log(f"image upload raised unexpected error: path={file_path} error={type(exc).__name__}: {exc}")
+                self._set_last_attachment_error(
+                    "图片发送失败了，飞书接口返回异常。请稍后重试，或让我重新生成后再发送。"
+                )
+                return False
+        if not upload_response.success():
+            log(
+                "image upload failed: "
+                f"code={upload_response.code} msg={upload_response.msg} "
+                f"log_id={upload_response.get_log_id()}"
+            )
+            return False
+        image_key = str(getattr(getattr(upload_response, "data", None), "image_key", "") or "").strip()
+        if not image_key:
+            log(f"image upload missing key: path={file_path}")
+            return False
+        return self._send_attachment_key(
+            receive_id_type="chat_id",
+            receive_id=chat_id,
+            msg_type="image",
+            key_name="image_key",
+            key_value=image_key,
+        )
+
+    def send_file_path(self, chat_id: str, path: Path) -> bool:
+        self._clear_last_attachment_error()
+        file_path = path.expanduser()
+        if not file_path.exists() or not file_path.is_file():
+            log(f"file send skipped: invalid path {file_path}")
+            return False
+        file_size_bytes = file_path.stat().st_size
+        if file_size_bytes > FEISHU_MAX_FILE_SIZE_BYTES:
+            return self._send_large_file_in_parts(chat_id, file_path, file_size_bytes)
+        return self._send_uploaded_file(chat_id, file_path)
+
+    def _send_uploaded_file(self, chat_id: str, file_path: Path) -> bool:
+        with file_path.open("rb") as f:
+            upload_request = (
+                lark.im.v1.CreateFileRequest.builder()
+                .request_body(
+                    lark.im.v1.CreateFileRequestBody.builder()
+                    .file_type("stream")
+                    .file_name(file_path.name)
+                    .file(f)
+                    .build()
+                )
+                .build()
+            )
+            try:
+                upload_response = self.client.im.v1.file.create(upload_request)
+            except Exception as exc:
+                log(f"file upload raised unexpected error: path={file_path} error={type(exc).__name__}: {exc}")
+                self._set_last_attachment_error(
+                    "文件发送失败了，飞书接口返回异常。请稍后重试；如果文件较大，也可以让我重新压缩或拆分后再发。"
+                )
+                return False
+        if not upload_response.success():
+            log(
+                "file upload failed: "
+                f"code={upload_response.code} msg={upload_response.msg} "
+                f"log_id={upload_response.get_log_id()}"
+            )
+            return False
+        file_key = str(getattr(getattr(upload_response, "data", None), "file_key", "") or "").strip()
+        if not file_key:
+            log(f"file upload missing key: path={file_path}")
+            return False
+        return self._send_attachment_key(
+            receive_id_type="chat_id",
+            receive_id=chat_id,
+            msg_type="file",
+            key_name="file_key",
+            key_value=file_key,
+        )
+
+    def _send_large_file_in_parts(self, chat_id: str, file_path: Path, file_size_bytes: int) -> bool:
+        size_text = _format_file_size_mb(file_size_bytes)
+        total_parts = max(1, (file_size_bytes + FEISHU_FILE_PART_SIZE_BYTES - 1) // FEISHU_FILE_PART_SIZE_BYTES)
+        width = _part_suffix_width(total_parts)
+        log(
+            "file exceeds Feishu upload limit, splitting into parts "
+            f"path={file_path} size_bytes={file_size_bytes} total_parts={total_parts}"
+        )
+        try:
+            with tempfile.TemporaryDirectory(prefix="feishu-file-parts-") as tmpdir:
+                with file_path.open("rb") as src:
+                    for idx in range(total_parts):
+                        remaining = min(
+                            FEISHU_FILE_PART_SIZE_BYTES,
+                            file_size_bytes - idx * FEISHU_FILE_PART_SIZE_BYTES,
+                        )
+                        part_name = f"{file_path.name}.part{idx + 1:0{width}d}"
+                        part_path = Path(tmpdir) / part_name
+                        with part_path.open("wb") as dst:
+                            bytes_left = remaining
+                            while bytes_left > 0:
+                                chunk = src.read(min(1024 * 1024, bytes_left))
+                                if not chunk:
+                                    break
+                                dst.write(chunk)
+                                bytes_left -= len(chunk)
+                        if bytes_left != 0:
+                            raise OSError(
+                                f"unexpected EOF while splitting file, part={idx + 1}, remaining={bytes_left}"
+                            )
+                        if not self._send_uploaded_file(chat_id, part_path):
+                            existing_error = self.consume_last_attachment_error()
+                            detail = (
+                                f"{file_path.name} 自动分片发送失败，卡在第 {idx + 1}/{total_parts} 片。"
+                            )
+                            if existing_error:
+                                detail = f"{detail}\n{existing_error}"
+                            self._set_last_attachment_error(detail)
+                            return False
+                notice = "\n".join(
+                    [
+                        f"{file_path.name} 超过飞书单文件上限，已自动拆成 {total_parts} 片发送。",
+                        f"原文件大小约 {size_text}。",
+                        "合并命令：",
+                        f"cat {file_path.name}.part* > {file_path.name}",
+                    ]
+                )
+                self.send_message(chat_id, notice)
+                self._clear_last_attachment_error()
+                return True
+        except Exception as exc:
+            log(f"file split failed: path={file_path} error={type(exc).__name__}: {exc}")
+            self._set_last_attachment_error(
+                f"{file_path.name} 自动分片发送失败了。\n"
+                "请稍后重试，或让我重新压缩后再发送。"
+            )
+            return False
+
     def _send_text(self, receive_id_type: str, receive_id: str, text: str) -> bool:
         request = (
             lark.im.v1.CreateMessageRequest.builder()
@@ -327,6 +565,49 @@ class FeishuAPI:
             "send failed: "
             f"code={response.code} msg={response.msg} "
             f"log_id={response.get_log_id()} receive_id_type={receive_id_type}"
+        )
+        return False
+
+    def _send_attachment_key(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        msg_type: str,
+        key_name: str,
+        key_value: str,
+    ) -> bool:
+        request = (
+            lark.im.v1.CreateMessageRequest.builder()
+            .receive_id_type(receive_id_type)
+            .request_body(
+                lark.im.v1.CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .msg_type(msg_type)
+                .content(json.dumps({key_name: key_value}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        try:
+            response = self.client.im.v1.message.create(request)
+        except Exception as exc:
+            log(
+                "send failed with exception: "
+                f"receive_id_type={receive_id_type} msg_type={msg_type} "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            if msg_type == "image":
+                self._set_last_attachment_error("图片发送失败了，飞书接口返回异常。请稍后重试。")
+            else:
+                self._set_last_attachment_error("文件发送失败了，飞书接口返回异常。请稍后重试。")
+            return False
+        if response.success():
+            return True
+        log(
+            "send failed: "
+            f"code={response.code} msg={response.msg} "
+            f"log_id={response.get_log_id()} receive_id_type={receive_id_type} "
+            f"msg_type={msg_type}"
         )
         return False
 
@@ -478,6 +759,25 @@ class FeishuCodexService:
             event_handler=self.event_handler,
         )
 
+    def _attachment_output_dir(self) -> Path:
+        target = self.state.path.parent / "attachments"
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _prompt_with_attachment_guidance(self, prompt: str) -> str:
+        attachment_dir = self._attachment_output_dir()
+        guidance = "\n".join(
+            [
+                "[飞书附件约束]",
+                "如果你要创建任何本地文件、截图、导出结果，并准备稍后发回飞书聊天，优先保存到这个目录：",
+                str(attachment_dir),
+                "最终回复里请使用绝对路径 Markdown 链接，例如 [文件名](/abs/path/file.png)。",
+                "尽量不要保存到 ~/Desktop、~/Documents、~/Downloads，除非用户明确要求。",
+                "如果这次不需要创建文件，就按正常方式回答。",
+            ]
+        )
+        return f"{guidance}\n\n[用户请求]\n{prompt}"
+
     def run_forever(self) -> None:
         log(
             "feishu long connection service started "
@@ -487,6 +787,25 @@ class FeishuCodexService:
             f"stream_min_delta_chars={self.stream_min_delta_chars}, "
             f"thinking_status_interval_ms={self.thinking_status_interval_ms})"
         )
+        try:
+            probe_result = _probe_home_directory_permissions()
+        except Exception as exc:
+            log(f"startup permission probe failed: {type(exc).__name__}: {exc}")
+        else:
+            for folder, item in probe_result.items():
+                status = str(item.get("status") or "unknown")
+                path = str(item.get("path") or "")
+                error = str(item.get("error") or "").strip()
+                if error:
+                    log(
+                        "startup permission probe: "
+                        f"folder={folder} status={status} path={path} error={error}"
+                    )
+                else:
+                    log(
+                        "startup permission probe: "
+                        f"folder={folder} status={status} path={path}"
+                    )
         self.ws_client.start()
 
     def _on_ignored_event(self, data: Any) -> None:
@@ -579,19 +898,33 @@ class FeishuCodexService:
         self._handle_text(chat_id, actor_id, text)
 
     def _handle_text(self, chat_id: str, actor_id: str, text: str) -> None:
+        attachment_state_key = self._attachment_state_key(chat_id, actor_id)
         if not text.startswith("/"):
+            if (
+                not is_compound_attachment_send_intent(text)
+                and self._try_handle_attachment_send_intent(chat_id, actor_id, text)
+            ):
+                return
+            if self._try_handle_attachment_pick(chat_id, actor_id, text):
+                return
             if self._try_handle_quick_model_pick(chat_id, actor_id, text):
+                return
+            if self._try_handle_quick_workspace_pick(chat_id, actor_id, text):
                 return
             if self._try_handle_quick_session_pick(chat_id, actor_id, text):
                 return
+            self.state.clear_attachment_picker(attachment_state_key)
             self.state.clear_model_picker(actor_id)
-            self.state.set_pending_session_pick(actor_id, False)
+            self._clear_session_pickers(actor_id)
             self._run_prompt(chat_id, actor_id, text)
             return
 
         cmd, arg = self._parse_command(text)
+        self.state.clear_attachment_picker(attachment_state_key)
         if cmd != "model":
             self.state.clear_model_picker(actor_id)
+        if cmd != "sessions":
+            self._clear_session_pickers(actor_id)
         if cmd in ("start", "help"):
             self._send_help(chat_id)
             return
@@ -635,7 +968,7 @@ class FeishuCodexService:
             "\n".join(
                 [
                     "可用命令:",
-                    "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
+                    "/sessions [N] - 先选工作区，再选最近会话",
                     "/use <编号|session_id> - 切换当前会话",
                     "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
@@ -643,13 +976,17 @@ class FeishuCodexService:
                     "/ask <内容> - 手动提问（可选）",
                     "/model - 查看并切换可用模型",
                     "/account - 查看今日额度与剩余额度",
-                    "执行 /sessions 后，可直接发送编号切换会话",
+                    "执行 /sessions 后，先发工作区编号，再发会话编号",
                     "执行 /model 后，可直接发送编号切换模型",
                     "后台执行时仍可发送 /use /sessions /status",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                 ]
             ),
         )
+
+    def _clear_session_pickers(self, actor_id: str) -> None:
+        self.state.clear_workspace_picker(actor_id)
+        self.state.clear_session_picker(actor_id)
 
     def _handle_sessions(self, chat_id: str, actor_id: str, arg: str) -> None:
         limit = 10
@@ -663,16 +1000,58 @@ class FeishuCodexService:
         if not items:
             self.api.send_message(chat_id, "未找到本地会话记录。")
             return
-        lines = ["最近会话（用 /use 编号 切换）:"]
-        session_ids = [s.session_id for s in items]
-        for i, s in enumerate(items, start=1):
-            short_id = s.session_id[:8]
-            cwd_name = Path(s.cwd).name or s.cwd
-            lines.append(f"{i}. {s.title} | {short_id} | {cwd_name}")
-        lines.append("直接发送编号即可切换（例如发送: 1）")
+        workspaces = group_sessions_by_workspace(items)
+        lines = ["最近工作区（先选工作区，再选会话）:"]
+        for idx, workspace in enumerate(workspaces, start=1):
+            count = len(workspace["session_ids"])
+            lines.append(f"{idx}. {workspace['label']} | {count} 条会话")
+        lines.append("先发送工作区编号（例如发送: 1）")
         self.api.send_message(chat_id, "\n".join(lines))
-        self.state.set_last_session_ids(actor_id, session_ids)
-        self.state.set_pending_session_pick(actor_id, True)
+        self.state.set_last_session_ids(actor_id, [])
+        self._clear_session_pickers(actor_id)
+        self.state.set_workspace_picker(actor_id, workspaces)
+
+    def _show_workspace_sessions(self, chat_id: str, actor_id: str, workspace: Dict[str, Any]) -> None:
+        session_ids = workspace.get("session_ids")
+        if not isinstance(session_ids, list):
+            self.state.set_last_session_ids(actor_id, [])
+            self.state.clear_session_picker(actor_id)
+            self.api.send_message(chat_id, "工作区列表已失效，请重新发送 /sessions。")
+            return
+        cwd = str(workspace.get("cwd") or "").strip()
+        label = str(workspace.get("label") or "当前工作区")
+        lines = [f"最近会话（工作区: {label}）:"]
+        available_session_ids: List[str] = []
+        picker_options: List[Dict[str, str]] = []
+        if cwd:
+            lines.append("1. 新建会话")
+            picker_options.append({"kind": "new", "cwd": cwd})
+        for raw_session_id in session_ids:
+            session_id = str(raw_session_id or "").strip()
+            if not session_id:
+                continue
+            meta = self.sessions.find_by_id(session_id)
+            if not meta:
+                continue
+            available_session_ids.append(meta.session_id)
+            picker_options.append(
+                {
+                    "kind": "session",
+                    "cwd": meta.cwd,
+                    "session_id": meta.session_id,
+                }
+            )
+            short_id = meta.session_id[:8]
+            lines.append(f"{len(picker_options)}. {meta.title} | {short_id}")
+        if not picker_options:
+            self.state.set_last_session_ids(actor_id, [])
+            self.state.clear_session_picker(actor_id)
+            self.api.send_message(chat_id, "该工作区下没有可用会话了，请重新发送 /sessions。")
+            return
+        lines.append("再发送会话编号即可切换（例如发送: 1）")
+        self.api.send_message(chat_id, "\n".join(lines))
+        self.state.set_last_session_ids(actor_id, available_session_ids)
+        self.state.set_session_picker(actor_id, picker_options)
 
     def _handle_use(self, chat_id: str, actor_id: str, arg: str) -> None:
         selector = arg.strip()
@@ -694,11 +1073,27 @@ class FeishuCodexService:
             self.api.send_message(chat_id, f"未找到 session: {session_id}")
             return
         self.state.set_active_session(actor_id, meta.session_id, meta.cwd)
-        self.state.set_pending_session_pick(actor_id, False)
+        self._clear_session_pickers(actor_id)
         self.api.send_message(
             chat_id,
             f"已切换到:\n{meta.title}\nsession: {meta.session_id}\ncwd: {meta.cwd}\n现在可直接发消息对话。",
         )
+
+    def _try_handle_quick_workspace_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
+        if not self.state.is_pending_workspace_pick(actor_id):
+            return False
+        raw = text.strip()
+        if not raw.isdigit():
+            return False
+        idx = int(raw)
+        picker = self.state.get_workspace_picker(actor_id)
+        workspaces = picker.get("workspaces")
+        if not isinstance(workspaces, list) or idx <= 0 or idx > len(workspaces):
+            self.api.send_message(chat_id, "工作区编号无效。请发送 /sessions 重新查看列表。")
+            return True
+        self.state.clear_workspace_picker(actor_id)
+        self._show_workspace_sessions(chat_id, actor_id, workspaces[idx - 1])
+        return True
 
     def _try_handle_quick_session_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
         if not self.state.is_pending_session_pick(actor_id):
@@ -707,6 +1102,24 @@ class FeishuCodexService:
         if not raw.isdigit():
             return False
         idx = int(raw)
+        picker = self.state.get_session_picker(actor_id)
+        options = picker.get("options")
+        if isinstance(options, list) and options:
+            if idx <= 0 or idx > len(options):
+                self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")
+                return True
+            option = options[idx - 1]
+            kind = str(option.get("kind") or "").strip()
+            if kind == "new":
+                cwd = str(option.get("cwd") or "").strip()
+                self._handle_new(chat_id, actor_id, cwd)
+                return True
+            session_id = str(option.get("session_id") or "").strip()
+            if not session_id:
+                self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")
+                return True
+            self._switch_to_session(chat_id, actor_id, session_id)
+            return True
         recent_ids = self.state.get_last_session_ids(actor_id)
         if idx <= 0 or idx > len(recent_ids):
             self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")
@@ -729,7 +1142,7 @@ class FeishuCodexService:
             lines.append(f"{idx}. {model}{marker}")
         self.api.send_message(chat_id, "\n".join(lines))
         self.state.clear_model_picker(actor_id)
-        self.state.set_pending_session_pick(actor_id, False)
+        self._clear_session_pickers(actor_id)
         self.state.set_model_picker(actor_id, models)
 
     def _try_handle_quick_model_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
@@ -873,7 +1286,7 @@ class FeishuCodexService:
                 return
             target_cwd = candidate
         self.state.clear_active_session(actor_id, str(target_cwd))
-        self.state.set_pending_session_pick(actor_id, False)
+        self._clear_session_pickers(actor_id)
         self.api.send_message(
             chat_id,
             f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",
@@ -914,6 +1327,210 @@ class FeishuCodexService:
         if keep <= 0:
             return raw[:max_size]
         return raw[:keep] + "…" + suffix
+
+    @staticmethod
+    def _attachment_state_key(chat_id: str, actor_id: str) -> str:
+        return f"{chat_id}::{actor_id}"
+
+    def _is_managed_attachment_path(self, path: Path) -> bool:
+        try:
+            resolved = Path(path).expanduser().resolve()
+            managed_dir = self._attachment_output_dir().resolve()
+            resolved.relative_to(managed_dir)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _attachment_display_name(candidate: Dict[str, str]) -> str:
+        raw_name = str(candidate.get("name") or "").strip()
+        if raw_name:
+            normalized = Path(raw_name).name.strip()
+            if normalized:
+                return normalized
+        raw_path = str(candidate.get("path") or "").strip()
+        normalized_path = Path(raw_path).name.strip()
+        return normalized_path or "该文件"
+
+    def _recent_attachment_candidates(self, chat_id: str, actor_id: str) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        state_key = self._attachment_state_key(chat_id, actor_id)
+        candidates: List[Dict[str, str]] = []
+        rejected: List[Dict[str, str]] = []
+        for item in self.state.get_recent_attachments(state_key):
+            path = Path(str(item.get("path") or "").strip()).expanduser()
+            kind = str(item.get("kind") or "").strip()
+            name = str(item.get("name") or path.name).strip()
+            if not path.is_absolute():
+                continue
+            preflight_permission_denied = False
+            try:
+                if not path.exists() or not path.is_file():
+                    continue
+            except OSError as exc:
+                if not _is_permission_shaped_os_error(exc):
+                    raise
+                preflight_permission_denied = True
+                log(
+                    "attachment preflight permission denied: "
+                    f"path={path} error={type(exc).__name__}: {exc}"
+                )
+            if kind not in ("image", "file"):
+                continue
+            allowed, reason = is_allowed_home_attachment_path(path)
+            if not allowed and reason == "outside_home" and self._is_managed_attachment_path(path):
+                allowed = True
+                reason = None
+            if not allowed:
+                rejected.append(
+                    {
+                        "path": str(path),
+                        "kind": kind,
+                        "name": name or path.name,
+                        "reason": reason or "unknown",
+                    }
+                )
+                continue
+            candidate = {"path": str(path), "kind": kind, "name": name or path.name}
+            if preflight_permission_denied:
+                candidate["preflight_permission_denied"] = "1"
+            candidates.append(candidate)
+        return candidates, rejected
+
+    @staticmethod
+    def _attachment_policy_reject_message(candidate: Dict[str, str]) -> str:
+        reason = str(candidate.get("reason") or "").strip()
+        name = FeishuCodexService._attachment_display_name(candidate)
+        if reason == "sensitive_path":
+            return f"根据安全策略，不允许发送敏感目录中的文件：{name}"
+        if reason == "outside_home":
+            return f"根据安全策略，仅允许发送 Home 目录或外接硬盘中的文件：{name}"
+        if reason == "unsupported_type":
+            return f"根据安全策略，不允许发送该类型文件：{name}"
+        return f"根据安全策略，不允许发送该文件：{name}"
+
+    @staticmethod
+    def _attachment_permission_help_message(candidate: Dict[str, str]) -> str:
+        name = FeishuCodexService._attachment_display_name(candidate)
+        return (
+            f"飞书服务缺少系统权限，无法读取附件：{name}\n"
+            "请在系统设置中为飞书服务开启对应文件夹访问权限（如桌面/文稿/下载），"
+            "或让我重新生成到可访问目录后再发送。"
+        )
+
+    def _send_attachment_candidate(self, chat_id: str, candidate: Dict[str, str]) -> Tuple[bool, Optional[str]]:
+        path = Path(candidate["path"])
+        name = self._attachment_display_name(candidate)
+        permission_help_message = self._attachment_permission_help_message(candidate)
+        if str(candidate.get("preflight_permission_denied") or "").strip():
+            log(f"attachment preflight permission denied: path={path}")
+            return (False, permission_help_message)
+        try:
+            if candidate["kind"] == "image":
+                ok = self.api.send_image_path(chat_id, path)
+            else:
+                ok = self.api.send_file_path(chat_id, path)
+        except PermissionError:
+            log(f"attachment send permission denied: path={path}")
+            return (False, permission_help_message)
+        except OSError as exc:
+            log(f"attachment send failed with os error: path={path} error={exc}")
+            if _is_permission_shaped_os_error(exc):
+                return (False, permission_help_message)
+            return (
+                False,
+                f"附件读取失败：{name}\n"
+                "请检查文件是否仍可访问，或让我重新生成到可访问目录后再发送。",
+            )
+        except Exception as exc:
+            log(f"attachment send raised unexpected error: path={path} error={type(exc).__name__}: {exc}")
+            api_error_message = self._consume_api_attachment_error_message()
+            return (False, api_error_message or "附件发送失败了，请稍后再试。")
+        if not ok:
+            api_error_message = self._consume_api_attachment_error_message()
+            return False, api_error_message or "附件发送失败了，请稍后再试。"
+        return True, None
+
+    def _consume_api_attachment_error_message(self) -> Optional[str]:
+        consumer = getattr(self.api, "consume_last_attachment_error", None)
+        if not callable(consumer):
+            return None
+        try:
+            message = consumer()
+        except Exception as exc:
+            log(f"attachment error consume failed: error={type(exc).__name__}: {exc}")
+            return None
+        if not message:
+            return None
+        text = str(message).strip()
+        return text or None
+
+    def _try_handle_attachment_send_intent(self, chat_id: str, actor_id: str, text: str) -> bool:
+        state_key = self._attachment_state_key(chat_id, actor_id)
+        if not is_attachment_send_intent(text):
+            return False
+        candidates, rejected = self._recent_attachment_candidates(chat_id, actor_id)
+        hints = extract_attachment_name_hints(text)
+        if hints:
+            hint_keys = {hint.lower() for hint in hints}
+            hinted_candidates = [item for item in candidates if str(item.get("name") or "").lower() in hint_keys]
+            if hinted_candidates:
+                candidates = hinted_candidates
+            else:
+                hinted_rejected = [item for item in rejected if str(item.get("name") or "").lower() in hint_keys]
+                candidates = []
+                rejected = hinted_rejected
+        if not candidates:
+            self.state.clear_attachment_picker(state_key)
+            if rejected:
+                self.api.send_message(chat_id, self._attachment_policy_reject_message(rejected[0]))
+            else:
+                self.api.send_message(chat_id, "当前没有可发送的最近附件。先让我生成或提到文件路径，再发送“发给我”。")
+            return True
+        if len(candidates) > 1:
+            lines = ["找到多个最近附件，回复编号即可发送:"]
+            for idx, candidate in enumerate(candidates, start=1):
+                kind_label = "图片" if candidate["kind"] == "image" else "文件"
+                lines.append(f"{idx}. {candidate['name']} ({kind_label})")
+            self.state.clear_model_picker(actor_id)
+            self._clear_session_pickers(actor_id)
+            self.state.set_attachment_picker(state_key, candidates)
+            self.api.send_message(chat_id, "\n".join(lines))
+            return True
+        self.state.clear_attachment_picker(state_key)
+        ok, error_message = self._send_attachment_candidate(chat_id, candidates[0])
+        if not ok and error_message:
+            self.api.send_message(chat_id, error_message)
+        return True
+
+    def _try_handle_attachment_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
+        state_key = self._attachment_state_key(chat_id, actor_id)
+        if not self.state.is_pending_attachment_pick(state_key):
+            return False
+        raw = text.strip()
+        if not raw.isdigit():
+            return False
+        idx = int(raw)
+        picker = self.state.get_attachment_picker(state_key)
+        attachments = picker.get("attachments")
+        if not isinstance(attachments, list) or idx <= 0 or idx > len(attachments):
+            self.api.send_message(chat_id, "附件编号无效。请重新发送编号。")
+            return True
+        candidate = attachments[idx - 1]
+        if not isinstance(candidate, dict):
+            self.api.send_message(chat_id, "附件编号无效。请重新发送编号。")
+            return True
+        ok, error_message = self._send_attachment_candidate(
+            chat_id,
+            {
+                "path": str(candidate.get("path") or "").strip(),
+                "kind": str(candidate.get("kind") or "").strip(),
+                "name": str(candidate.get("name") or "").strip(),
+            },
+        )
+        self.state.clear_attachment_picker(state_key)
+        if not ok and error_message:
+            self.api.send_message(chat_id, error_message)
+        return True
 
     def _finalize_stream_reply(
         self,
@@ -1086,8 +1703,9 @@ class FeishuCodexService:
 
         try:
             selected_model = self.state.get_selected_model(actor_id)
+            effective_prompt = self._prompt_with_attachment_guidance(prompt)
             thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
-                prompt=prompt,
+                prompt=effective_prompt,
                 cwd=cwd,
                 session_id=active_id,
                 model=selected_model,
@@ -1097,6 +1715,10 @@ class FeishuCodexService:
             thinking_stop.set()
             if thinking_thread is not None:
                 thinking_thread.join(timeout=0.3)
+            self.state.set_recent_attachments(
+                self._attachment_state_key(chat_id, actor_id),
+                [],
+            )
             err_msg = self._format_prompt_response(
                 session_label,
                 f"调用 Codex 时出现异常: {e}",
@@ -1122,6 +1744,7 @@ class FeishuCodexService:
 
         final_session_id = thread_id or active_id
         final_session_label = self._session_label(final_session_id, cwd)
+        attachment_state_key = self._attachment_state_key(chat_id, actor_id)
         session_updated = False
         if thread_id:
             session_updated = self.state.update_active_session_if_unchanged(
@@ -1132,6 +1755,7 @@ class FeishuCodexService:
             )
 
         if return_code != 0:
+            self.state.set_recent_attachments(attachment_state_key, [])
             msg = f"Codex 执行失败 (exit={return_code})\n{answer}"
             if stderr_text:
                 msg += f"\n\nstderr:\n{stderr_text[-1200:]}"
@@ -1151,6 +1775,14 @@ class FeishuCodexService:
                 answer = f"{note}\n\n{answer}"
 
         answer = self._format_prompt_response(final_session_label, answer)
+        attachment_candidates = extract_local_attachment_candidates(answer)
+        if attachment_candidates:
+            self.state.set_recent_attachments(
+                attachment_state_key,
+                attachment_candidates,
+            )
+        else:
+            self.state.set_recent_attachments(attachment_state_key, [])
         if use_stream and stream_message_id:
             replay = int(stream_state.get("content_updates") or 0) == 0
             self._finalize_stream_reply(chat_id, stream_message_id, answer, progressive_replay=replay)
