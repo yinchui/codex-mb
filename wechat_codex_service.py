@@ -18,13 +18,19 @@ from codex_common import (
     CodexRunner,
     RunningPromptRegistry,
     SessionStore,
+    build_workspace_choices,
     chunk_text,
     env,
+    format_missing_workspace_write_warning,
+    format_workspace_choices_message,
+    format_workspace_sessions_message,
+    list_workspace_sessions,
     log,
     parse_bool_env,
     parse_dangerous_bypass_level,
     parse_non_negative_int,
     resolve_codex_bin,
+    run_prompt_with_workspace_write_recovery,
 )
 
 
@@ -498,11 +504,15 @@ class WechatCodexService:
         if not text:
             return
 
-        log(f"wechat message received: user_id={from_user_id} text={text[:80]!r}")
+        log(
+            "wechat message received: "
+            f"user_id={from_user_id} "
+            f"{self._safe_log_descriptor(text)}"
+        )
         if not text.startswith("/"):
             if self._try_handle_quick_session_pick(from_user_id, context_token, text):
                 return
-            self.state.set_pending_session_pick(from_user_id, False)
+            self.state.clear_session_picker(from_user_id)
             self._run_prompt(from_user_id, context_token, text)
             return
 
@@ -537,13 +547,13 @@ class WechatCodexService:
             "\n".join(
                 [
                     "可用命令:",
-                    "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
+                    "/sessions - 查看工作区列表，再选择工作区下的会话",
                     "/use <编号|session_id> - 切换当前会话",
                     "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
                     "/status - 查看当前绑定会话",
                     "/ask <内容> - 手动提问（可选）",
-                    "执行 /sessions 后，可直接发送编号切换会话",
+                    "执行 /sessions 后，可先选工作区，再选会话或发送 0 新建会话",
                     "后台执行时仍可发送 /use /sessions /status",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                 ]
@@ -551,27 +561,15 @@ class WechatCodexService:
         )
 
     def _handle_sessions(self, actor_id: str, context_token: str, arg: str) -> None:
-        limit = 10
         if arg:
-            try:
-                limit = max(1, min(30, int(arg)))
-            except ValueError:
-                self._send_text(actor_id, context_token, "参数错误，示例: /sessions 10")
-                return
-        items = self.sessions.list_recent(limit=limit)
-        if not items:
-            self._send_text(actor_id, context_token, "未找到本地会话记录。")
+            self._send_text(actor_id, context_token, "当前 /sessions 不需要参数，直接发送 /sessions 即可。")
             return
-        lines = ["最近会话（用 /use 编号 切换）:"]
-        session_ids = [s.session_id for s in items]
-        for i, s in enumerate(items, start=1):
-            short_id = s.session_id[:8]
-            cwd_name = Path(s.cwd).name or s.cwd
-            lines.append(f"{i}. {s.title} | {short_id} | {cwd_name}")
-        lines.append("直接发送编号即可切换（例如发送: 1）")
-        self._send_text(actor_id, context_token, "\n".join(lines))
-        self.state.set_last_session_ids(actor_id, session_ids)
-        self.state.set_pending_session_pick(actor_id, True)
+        choices = build_workspace_choices(self.sessions)
+        if not choices:
+            self._send_text(actor_id, context_token, "未找到工作区。请先在 Codex 左侧边栏添加工作区。")
+            return
+        self._send_text(actor_id, context_token, format_workspace_choices_message(choices))
+        self.state.set_workspace_picker(actor_id, [choice.root for choice in choices])
 
     def _resolve_session_selector(self, actor_id: str, selector: str) -> Tuple[Optional[str], Optional[str]]:
         raw = selector.strip()
@@ -591,7 +589,7 @@ class WechatCodexService:
             self._send_text(actor_id, context_token, f"未找到 session: {session_id}")
             return
         self.state.set_active_session(actor_id, meta.session_id, meta.cwd)
-        self.state.set_pending_session_pick(actor_id, False)
+        self.state.clear_session_picker(actor_id)
         self._send_text(
             actor_id,
             context_token,
@@ -615,11 +613,44 @@ class WechatCodexService:
         if not raw.isdigit():
             return False
         idx = int(raw)
-        recent_ids = self.state.get_last_session_ids(actor_id)
-        if idx <= 0 or idx > len(recent_ids):
-            self._send_text(actor_id, context_token, "编号无效。请发送 /sessions 重新查看列表。")
+        picker = self.state.get_session_picker(actor_id)
+        mode = str(picker.get("mode") or "")
+        if mode == "workspace":
+            workspace_roots = picker.get("workspace_roots")
+            if not isinstance(workspace_roots, list) or idx <= 0 or idx > len(workspace_roots):
+                self._send_text(actor_id, context_token, "工作区编号无效。请发送 /sessions 重新查看列表。")
+                return True
+            workspace_root = str(workspace_roots[idx - 1])
+            workspace_sessions = list_workspace_sessions(self.sessions, workspace_root, limit=20)
+            self._send_text(
+                actor_id,
+                context_token,
+                format_workspace_sessions_message(workspace_root, workspace_sessions),
+            )
+            self.state.set_workspace_session_picker(
+                actor_id,
+                workspace_root,
+                [item.session_id for item in workspace_sessions],
+            )
             return True
-        self._switch_to_session(actor_id, context_token, recent_ids[idx - 1])
+        if mode == "session":
+            workspace_root = str(picker.get("workspace_root") or "").strip()
+            session_ids = picker.get("session_ids")
+            if idx == 0 and workspace_root:
+                self.state.clear_active_session(actor_id, workspace_root)
+                self.state.clear_session_picker(actor_id)
+                self._send_text(
+                    actor_id,
+                    context_token,
+                    f"已进入新会话模式，cwd: {workspace_root}\n下一条普通消息会新建 session。",
+                )
+                return True
+            if not isinstance(session_ids, list) or idx <= 0 or idx > len(session_ids):
+                self._send_text(actor_id, context_token, "会话编号无效。请发送 /sessions 重新查看列表。")
+                return True
+            self._switch_to_session(actor_id, context_token, str(session_ids[idx - 1]))
+            return True
+        self._send_text(actor_id, context_token, "编号无效。请发送 /sessions 重新查看列表。")
         return True
 
     def _handle_history(self, actor_id: str, context_token: str, arg: str) -> None:
@@ -711,11 +742,11 @@ class WechatCodexService:
                 return
             target_cwd = candidate
         self.state.clear_active_session(actor_id, str(target_cwd))
-        self.state.set_pending_session_pick(actor_id, False)
+        self.state.clear_session_picker(actor_id)
         self._send_text(
             actor_id,
             context_token,
-            f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",
+            f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会新建 session。",
         )
 
     def _session_label(self, session_id: Optional[str], cwd: Path) -> str:
@@ -765,6 +796,14 @@ class WechatCodexService:
             self.running_prompts.finish(actor_id, active_id)
             raise
 
+    @staticmethod
+    def _safe_log_descriptor(text: str) -> str:
+        stripped = text.strip()
+        if stripped.startswith("/"):
+            cmd = stripped.split(None, 1)[0]
+            return f"command={cmd} text_len={len(stripped)}"
+        return f"text_len={len(stripped)}"
+
     def _run_prompt_worker(
         self,
         actor_id: str,
@@ -781,7 +820,8 @@ class WechatCodexService:
             typing.start()
 
         try:
-            thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
+            execution = run_prompt_with_workspace_write_recovery(
+                self.codex,
                 prompt=prompt,
                 cwd=cwd,
                 session_id=active_id,
@@ -796,11 +836,18 @@ class WechatCodexService:
                 typing.stop()
             self.running_prompts.finish(actor_id, active_id)
 
+        thread_id = execution.thread_id
+        answer = execution.answer
+        stderr_text = execution.stderr_text
+        return_code = execution.return_code
+        verification = execution.verification
+
         elapsed_sec = round(time.time() - run_started_at, 2)
         log(
             "wechat prompt finished: "
             f"actor={actor_id} session={active_id} thread={thread_id} "
-            f"exit={return_code} elapsed_sec={elapsed_sec}"
+            f"exit={return_code} elapsed_sec={elapsed_sec} "
+            f"retry_attempted={execution.retry_attempted} retry_recovered={execution.retry_recovered}"
         )
 
         final_session_id = thread_id or active_id
@@ -828,6 +875,13 @@ class WechatCodexService:
                 if not active_id:
                     note = "新线程已创建，但你已经切到别的线程，当前活动线程未变。"
                 answer = f"{note}\n\n{answer}"
+
+        if verification.required and not verification.is_verified:
+            log(
+                "workspace write verification failed: "
+                f"actor={actor_id} cwd={verification.cwd} prompt_len={len(prompt.strip())}"
+            )
+            answer = format_missing_workspace_write_warning(answer, verification)
 
         self._send_text(actor_id, context_token, self._format_prompt_response(final_session_label, answer))
 

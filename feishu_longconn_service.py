@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -21,12 +22,19 @@ from codex_common import (
     CodexRunner,
     RunningPromptRegistry,
     SessionStore,
+    build_workspace_choices,
     chunk_text,
     env,
+    format_missing_workspace_write_warning,
+    format_workspace_choices_message,
+    format_workspace_sessions_message,
+    list_workspace_sessions,
     log,
+    parse_bool_env,
     parse_dangerous_bypass_level,
     parse_non_negative_int,
     resolve_codex_bin,
+    run_prompt_with_workspace_write_recovery,
 )
 
 
@@ -175,6 +183,66 @@ def parse_incoming_message_content(message_type: str, raw: Optional[str]) -> str
     if msg_type == "post":
         return parse_post_content(raw)
     return ""
+
+
+class FeishuOwnerStateStore:
+    def __init__(self, runtime_dir: Path):
+        self.runtime_dir = runtime_dir.expanduser()
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.runtime_dir / "owner_state.json"
+        self._lock = threading.RLock()
+
+    def load(self) -> Dict[str, Any]:
+        with self._lock:
+            if not self.path.exists():
+                return {}
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+            return payload if isinstance(payload, dict) else {}
+
+    def save(self, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+    def clear(self) -> None:
+        self.save({})
+
+    def get_owner(self) -> Optional[Dict[str, Any]]:
+        owner = self.load().get("owner")
+        return dict(owner) if isinstance(owner, dict) else None
+
+    def set_owner(self, open_id: str) -> Dict[str, Any]:
+        payload = self.load()
+        owner = {
+            "open_id": open_id,
+            "paired_at": int(time.time() * 1000),
+        }
+        payload["owner"] = owner
+        payload.pop("pairing_window", None)
+        self.save(payload)
+        return owner
+
+    def get_pairing_window(self) -> Optional[Dict[str, Any]]:
+        window = self.load().get("pairing_window")
+        return dict(window) if isinstance(window, dict) else None
+
+    def issue_pair_code(self, ttl_seconds: int = 600) -> Dict[str, Any]:
+        ttl = max(30, int(ttl_seconds))
+        payload = self.load()
+        window = {
+            "pair_code": secrets.token_hex(3).upper(),
+            "issued_at": int(time.time() * 1000),
+            "pair_code_expires_at": int(time.time() * 1000) + ttl * 1000,
+        }
+        payload["pairing_window"] = window
+        self.save(payload)
+        return window
 
 
 def adapt_markdown_for_feishu(markdown: str) -> Tuple[str, str]:
@@ -442,6 +510,8 @@ class FeishuCodexService:
         stream_edit_interval_ms: int,
         stream_min_delta_chars: int,
         thinking_status_interval_ms: int,
+        runtime_dir: Optional[Path] = None,
+        owner_mode_enabled: bool = True,
     ):
         self.api = api
         self.sessions = sessions
@@ -455,6 +525,10 @@ class FeishuCodexService:
         self.stream_edit_interval_ms = max(250, stream_edit_interval_ms)
         self.stream_min_delta_chars = max(1, stream_min_delta_chars)
         self.thinking_status_interval_ms = max(500, thinking_status_interval_ms)
+        self.runtime_dir = (runtime_dir or (default_cwd / ".runtime" / "feishu")).expanduser()
+        self._owner_state_store_impl = FeishuOwnerStateStore(self.runtime_dir)
+        self.owner_state_path = self._owner_state_store_impl.path
+        self.owner_mode_enabled = owner_mode_enabled
         self.running_prompts = RunningPromptRegistry()
         self.startup_time_ms = int(time.time() * 1000)
         self.seen_event_ids: Set[str] = set()
@@ -482,9 +556,112 @@ class FeishuCodexService:
             f"stream_enabled={self.stream_enabled}, "
             f"stream_edit_interval_ms={self.stream_edit_interval_ms}, "
             f"stream_min_delta_chars={self.stream_min_delta_chars}, "
-            f"thinking_status_interval_ms={self.thinking_status_interval_ms})"
+            f"thinking_status_interval_ms={self.thinking_status_interval_ms}, "
+            f"owner_mode_enabled={self.owner_mode_enabled})"
         )
         self.ws_client.start()
+
+    def issue_pair_code(self, ttl_seconds: int = 600) -> str:
+        return str(self._owner_state_store_impl.issue_pair_code(ttl_seconds).get("pair_code") or "")
+
+    def get_current_owner(self) -> Optional[Dict[str, Any]]:
+        return self._owner_state_store_impl.get_owner()
+
+    def get_current_pairing_window(self) -> Optional[Dict[str, Any]]:
+        return self._owner_state_store_impl.get_pairing_window()
+
+    @property
+    def owner_state_path(self) -> Path:
+        stored = getattr(self, "_owner_state_path", None)
+        if stored is not None:
+            return Path(stored)
+        return self._owner_state_store_impl.path
+
+    @owner_state_path.setter
+    def owner_state_path(self, value: Path) -> None:
+        self._owner_state_path = Path(value)
+
+    @staticmethod
+    def _safe_log_descriptor(text: str) -> str:
+        stripped = text.strip()
+        if stripped.startswith("/"):
+            cmd = stripped.split(None, 1)[0]
+            return f"command={cmd} text_len={len(stripped)}"
+        return f"text_len={len(stripped)}"
+
+    def _is_owner(self, sender_open_id: str) -> bool:
+        owner = self.get_current_owner()
+        if not owner:
+            return False
+        return str(owner.get("open_id") or "").strip() == sender_open_id
+
+    def _ensure_owner_authorized(
+        self,
+        *,
+        chat_id: str,
+        chat_type: str,
+        sender_open_id: str,
+    ) -> bool:
+        if not self.owner_mode_enabled:
+            return True
+        owner = self.get_current_owner()
+        if owner is None:
+            if chat_type != "p2p":
+                self.api.send_message(chat_id, "当前还未完成 owner 配对，请先私聊机器人并发送 /pair <code>。")
+                return False
+            self.api.send_message(chat_id, "当前还未完成 owner 配对。请先在本机执行 pair-code，然后私聊发送 /pair <code>。")
+            return False
+        if self._is_owner(sender_open_id):
+            return True
+        self.api.send_message(chat_id, "只有已绑定的 owner 可以使用这个 bot。")
+        return False
+
+    def _handle_pair(self, chat_id: str, chat_type: str, sender_open_id: str, arg: str) -> None:
+        if not self.owner_mode_enabled:
+            self.api.send_message(chat_id, "当前未启用 owner mode。")
+            return
+        if chat_type != "p2p":
+            self.api.send_message(chat_id, "请在私聊里执行配对：/pair <code>")
+            return
+        code = arg.strip().upper()
+        if not code:
+            self.api.send_message(chat_id, "示例: /pair ABC123")
+            return
+        window = self.get_current_pairing_window()
+        if not window:
+            self.api.send_message(chat_id, "当前没有有效的 pair code。请先在本机执行 pair-code。")
+            return
+        expires_at = parse_epoch_ms(window.get("pair_code_expires_at"))
+        if expires_at is not None and expires_at < int(time.time() * 1000):
+            self.api.send_message(chat_id, "pair code 已过期，请在本机重新执行 pair-code。")
+            return
+        expected = str(window.get("pair_code") or "").strip().upper()
+        if not expected or code != expected:
+            self.api.send_message(chat_id, "pair code 无效，请确认后重试。")
+            return
+        owner = self._owner_state_store_impl.set_owner(sender_open_id)
+        self.api.send_message(chat_id, f"paired 成功，当前 owner: {owner['open_id']}")
+
+    def _handle_owner(self, chat_id: str) -> None:
+        owner = self.get_current_owner()
+        window = self.get_current_pairing_window()
+        lines = [f"owner mode: {'on' if self.owner_mode_enabled else 'off'}"]
+        if owner is not None:
+            lines.append(f"paired: yes ({owner.get('open_id')})")
+        else:
+            lines.append("paired: no")
+        if window is not None:
+            lines.append("pairing_window: active")
+        self.api.send_message(chat_id, "\n".join(lines))
+
+    def _handle_whoami(self, chat_id: str, sender_open_id: str, sender_user_id: str) -> None:
+        owner = self.get_current_owner()
+        lines = [
+            f"open_id: {sender_open_id or '-'}",
+            f"user_id: {sender_user_id or '-'}",
+            f"is_owner: {'yes' if owner and str(owner.get('open_id') or '') == sender_open_id else 'no'}",
+        ]
+        self.api.send_message(chat_id, "\n".join(lines))
 
     def _on_ignored_event(self, data: Any) -> None:
         header = getattr(data, "header", None)
@@ -571,15 +748,40 @@ class FeishuCodexService:
             "message received: "
             f"actor={actor_id} chat_id={chat_id} chat_type={chat_type} "
             f"message_id={message_id or '-'} create_time={message_create_time or '-'} "
-            f"text={text[:80]!r}"
+            f"{self._safe_log_descriptor(text)}"
         )
-        self._handle_text(chat_id, actor_id, text)
+        self._handle_text(chat_id, chat_type, actor_id, sender_open_id, sender_user_id, text)
 
-    def _handle_text(self, chat_id: str, actor_id: str, text: str) -> None:
+    def _handle_text(
+        self,
+        chat_id: str,
+        chat_type: str,
+        actor_id: str,
+        sender_open_id: str,
+        sender_user_id: str,
+        text: str,
+    ) -> None:
+        if text.startswith("/"):
+            cmd, arg = self._parse_command(text)
+            if cmd == "pair":
+                self._handle_pair(chat_id, chat_type, sender_open_id, arg)
+                return
+            if cmd == "owner":
+                self._handle_owner(chat_id)
+                return
+            if cmd == "whoami":
+                self._handle_whoami(chat_id, sender_open_id, sender_user_id)
+                return
+        if not self._ensure_owner_authorized(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        ):
+            return
         if not text.startswith("/"):
             if self._try_handle_quick_session_pick(chat_id, actor_id, text):
                 return
-            self.state.set_pending_session_pick(actor_id, False)
+            self.state.clear_session_picker(actor_id)
             self._run_prompt(chat_id, actor_id, text)
             return
 
@@ -621,13 +823,15 @@ class FeishuCodexService:
             "\n".join(
                 [
                     "可用命令:",
-                    "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
+                    "/sessions - 查看工作区列表，再选择工作区下的会话",
                     "/use <编号|session_id> - 切换当前会话",
                     "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
                     "/status - 查看当前绑定会话",
+                    "/owner - 查看 owner 配对状态",
+                    "/whoami - 查看当前飞书身份",
                     "/ask <内容> - 手动提问（可选）",
-                    "执行 /sessions 后，可直接发送编号切换会话",
+                    "执行 /sessions 后，可先选工作区，再选会话或发送 0 新建会话",
                     "后台执行时仍可发送 /use /sessions /status",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                 ]
@@ -635,27 +839,15 @@ class FeishuCodexService:
         )
 
     def _handle_sessions(self, chat_id: str, actor_id: str, arg: str) -> None:
-        limit = 10
         if arg:
-            try:
-                limit = max(1, min(30, int(arg)))
-            except ValueError:
-                self.api.send_message(chat_id, "参数错误，示例: /sessions 10")
-                return
-        items = self.sessions.list_recent(limit=limit)
-        if not items:
-            self.api.send_message(chat_id, "未找到本地会话记录。")
+            self.api.send_message(chat_id, "当前 /sessions 不需要参数，直接发送 /sessions 即可。")
             return
-        lines = ["最近会话（用 /use 编号 切换）:"]
-        session_ids = [s.session_id for s in items]
-        for i, s in enumerate(items, start=1):
-            short_id = s.session_id[:8]
-            cwd_name = Path(s.cwd).name or s.cwd
-            lines.append(f"{i}. {s.title} | {short_id} | {cwd_name}")
-        lines.append("直接发送编号即可切换（例如发送: 1）")
-        self.api.send_message(chat_id, "\n".join(lines))
-        self.state.set_last_session_ids(actor_id, session_ids)
-        self.state.set_pending_session_pick(actor_id, True)
+        choices = build_workspace_choices(self.sessions)
+        if not choices:
+            self.api.send_message(chat_id, "未找到工作区。请先在 Codex 左侧边栏添加工作区。")
+            return
+        self.api.send_message(chat_id, format_workspace_choices_message(choices))
+        self.state.set_workspace_picker(actor_id, [choice.root for choice in choices])
 
     def _handle_use(self, chat_id: str, actor_id: str, arg: str) -> None:
         selector = arg.strip()
@@ -677,7 +869,7 @@ class FeishuCodexService:
             self.api.send_message(chat_id, f"未找到 session: {session_id}")
             return
         self.state.set_active_session(actor_id, meta.session_id, meta.cwd)
-        self.state.set_pending_session_pick(actor_id, False)
+        self.state.clear_session_picker(actor_id)
         self.api.send_message(
             chat_id,
             f"已切换到:\n{meta.title}\nsession: {meta.session_id}\ncwd: {meta.cwd}\n现在可直接发消息对话。",
@@ -690,11 +882,39 @@ class FeishuCodexService:
         if not raw.isdigit():
             return False
         idx = int(raw)
-        recent_ids = self.state.get_last_session_ids(actor_id)
-        if idx <= 0 or idx > len(recent_ids):
-            self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")
+        picker = self.state.get_session_picker(actor_id)
+        mode = str(picker.get("mode") or "")
+        if mode == "workspace":
+            workspace_roots = picker.get("workspace_roots")
+            if not isinstance(workspace_roots, list) or idx <= 0 or idx > len(workspace_roots):
+                self.api.send_message(chat_id, "工作区编号无效。请发送 /sessions 重新查看列表。")
+                return True
+            workspace_root = str(workspace_roots[idx - 1])
+            workspace_sessions = list_workspace_sessions(self.sessions, workspace_root, limit=20)
+            self.api.send_message(chat_id, format_workspace_sessions_message(workspace_root, workspace_sessions))
+            self.state.set_workspace_session_picker(
+                actor_id,
+                workspace_root,
+                [item.session_id for item in workspace_sessions],
+            )
             return True
-        self._switch_to_session(chat_id, actor_id, recent_ids[idx - 1])
+        if mode == "session":
+            workspace_root = str(picker.get("workspace_root") or "").strip()
+            session_ids = picker.get("session_ids")
+            if idx == 0 and workspace_root:
+                self.state.clear_active_session(actor_id, workspace_root)
+                self.state.clear_session_picker(actor_id)
+                self.api.send_message(
+                    chat_id,
+                    f"已进入新会话模式，cwd: {workspace_root}\n下一条普通消息会新建 session。",
+                )
+                return True
+            if not isinstance(session_ids, list) or idx <= 0 or idx > len(session_ids):
+                self.api.send_message(chat_id, "会话编号无效。请发送 /sessions 重新查看列表。")
+                return True
+            self._switch_to_session(chat_id, actor_id, str(session_ids[idx - 1]))
+            return True
+        self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")
         return True
 
     def _handle_history(self, chat_id: str, actor_id: str, arg: str) -> None:
@@ -804,10 +1024,10 @@ class FeishuCodexService:
                 return
             target_cwd = candidate
         self.state.clear_active_session(actor_id, str(target_cwd))
-        self.state.set_pending_session_pick(actor_id, False)
+        self.state.clear_session_picker(actor_id)
         self.api.send_message(
             chat_id,
-            f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",
+            f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会新建 session。",
         )
 
     def _session_label(self, session_id: Optional[str], cwd: Path) -> str:
@@ -1015,12 +1235,19 @@ class FeishuCodexService:
             stream_state["last_emit_at_ms"] = now_ms
             stream_state["content_updates"] = int(stream_state.get("content_updates") or 0) + 1
 
+        def on_retry_status(status_text: str) -> None:
+            first_output.set()
+            if use_stream and stream_message_id:
+                patch_stream_message(self._format_prompt_response(session_label, status_text))
+
         try:
-            thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
+            execution = run_prompt_with_workspace_write_recovery(
+                self.codex,
                 prompt=prompt,
                 cwd=cwd,
                 session_id=active_id,
                 on_update=on_update if use_stream else None,
+                on_retry_status=on_retry_status,
             )
         except Exception as e:
             thinking_stop.set()
@@ -1041,12 +1268,19 @@ class FeishuCodexService:
                 thinking_thread.join(timeout=0.3)
             self.running_prompts.finish(actor_id, active_id)
 
+        thread_id = execution.thread_id
+        answer = execution.answer
+        stderr_text = execution.stderr_text
+        return_code = execution.return_code
+        verification = execution.verification
+
         elapsed_sec = round(time.time() - run_started_at, 2)
         first_output_sec = round(first_output_at[0] - run_started_at, 2) if first_output_at else None
         log(
             "prompt finished: "
             f"actor={actor_id} session={active_id} thread={thread_id} exit={return_code} "
-            f"elapsed_sec={elapsed_sec} first_output_sec={first_output_sec}"
+            f"elapsed_sec={elapsed_sec} first_output_sec={first_output_sec} "
+            f"retry_attempted={execution.retry_attempted} retry_recovered={execution.retry_recovered}"
         )
 
         final_session_id = thread_id or active_id
@@ -1079,6 +1313,13 @@ class FeishuCodexService:
                     note = "新线程已创建，但你已经切到别的线程，当前活动线程未变。"
                 answer = f"{note}\n\n{answer}"
 
+        if verification.required and not verification.is_verified:
+            log(
+                "workspace write verification failed: "
+                f"actor={actor_id} cwd={verification.cwd} prompt_len={len(prompt.strip())}"
+            )
+            answer = format_missing_workspace_write_warning(answer, verification)
+
         answer = self._format_prompt_response(final_session_label, answer)
         if use_stream and stream_message_id:
             replay = int(stream_state.get("content_updates") or 0) == 0
@@ -1097,6 +1338,7 @@ def build_service() -> FeishuCodexService:
     allowed_open_ids = parse_allowed_open_ids(env("ALLOWED_FEISHU_OPEN_IDS"))
     session_root = Path(env("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
     state_path = Path(env("STATE_PATH", "./feishu_bot_state.json"))
+    runtime_dir = Path(env("FEISHU_RUNTIME_DIR", str(state_path.parent / "feishu"))).expanduser()
     codex_bin = resolve_codex_bin(env("CODEX_BIN"))
     codex_sandbox_mode = env("CODEX_SANDBOX_MODE")
     codex_approval_policy = env("CODEX_APPROVAL_POLICY")
@@ -1106,7 +1348,8 @@ def build_service() -> FeishuCodexService:
         3600,
     )
     default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
-    enable_p2p = env("FEISHU_ENABLE_P2P", "0") == "1"
+    owner_mode_enabled = parse_bool_env(env("FEISHU_OWNER_MODE", "1"), True)
+    enable_p2p = parse_bool_env(env("FEISHU_ENABLE_P2P"), owner_mode_enabled)
     log_level = env("FEISHU_LOG_LEVEL", "INFO") or "INFO"
     rich_message_enabled = env("FEISHU_RICH_MESSAGE", "1") == "1"
     stream_enabled = env("FEISHU_STREAM_ENABLED", "1") == "1"
@@ -1166,6 +1409,8 @@ def build_service() -> FeishuCodexService:
         stream_edit_interval_ms=stream_edit_interval_ms,
         stream_min_delta_chars=stream_min_delta_chars,
         thinking_status_interval_ms=thinking_status_interval_ms,
+        runtime_dir=runtime_dir,
+        owner_mode_enabled=owner_mode_enabled,
     )
 
 

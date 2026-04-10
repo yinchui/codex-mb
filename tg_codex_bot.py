@@ -23,13 +23,19 @@ from codex_common import (
     CodexRunner,
     RunningPromptRegistry,
     SessionStore,
+    build_workspace_choices,
     chunk_text,
     env,
+    format_missing_workspace_write_warning,
+    format_workspace_choices_message,
+    format_workspace_sessions_message,
+    list_workspace_sessions,
     log,
     parse_bool_env,
     parse_dangerous_bypass_level,
     parse_non_negative_int,
     resolve_codex_bin,
+    run_prompt_with_workspace_write_recovery,
 )
 
 
@@ -37,7 +43,7 @@ MAX_TELEGRAM_TEXT = 4096
 BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "start", "description": "开始使用"},
     {"command": "help", "description": "查看帮助"},
-    {"command": "sessions", "description": "查看最近会话"},
+    {"command": "sessions", "description": "查看工作区与会话"},
     {"command": "use", "description": "切换会话"},
     {"command": "history", "description": "查看会话历史"},
     {"command": "new", "description": "新建会话模式"},
@@ -585,7 +591,7 @@ class TgCodexService:
         if not text.startswith("/"):
             if self._try_handle_quick_session_pick(chat_id, message_id, int(user_id), text):
                 return
-            self.state.set_pending_session_pick(int(user_id), False)
+            self.state.clear_session_picker(int(user_id))
             self._handle_chat_message(chat_id, message_id, int(user_id), text)
             return
 
@@ -639,6 +645,18 @@ class TgCodexService:
             self.api.answer_callback_query(cq_id, text="正在切换会话...")
             self._switch_to_session(chat_id, reply_to, int(user_id), session_id)
             return
+        if data.startswith("ws:"):
+            idx_raw = data[3:]
+            if not idx_raw.isdigit():
+                self.api.answer_callback_query(cq_id, text="工作区编号无效。", show_alert=True)
+                return
+            self.api.answer_callback_query(cq_id, text="正在打开工作区...")
+            self._open_workspace_sessions(chat_id, reply_to, int(user_id), int(idx_raw))
+            return
+        if data == "wsnew":
+            self.api.answer_callback_query(cq_id, text="已切换到新会话模式。")
+            self._activate_workspace_new_session(chat_id, reply_to, int(user_id))
+            return
 
         self.api.answer_callback_query(cq_id, text="不支持的操作。", show_alert=True)
 
@@ -656,14 +674,14 @@ class TgCodexService:
             "\n".join(
                 [
                     "可用命令:",
-                    "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
+                    "/sessions - 查看工作区列表，再选择工作区下的会话",
                     "/use <编号|session_id> - 切换当前会话",
                     "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
                     "/status - 查看当前绑定会话",
                     "/ask <内容> - 手动提问（可选）",
-                    "执行 /sessions 后，可直接发送编号切换会话",
-                    "执行 /sessions 后，也可点击按钮直接切换会话",
+                    "执行 /sessions 后，可先选工作区，再选会话或发送 0 新建会话",
+                    "执行 /sessions 后，也可直接点击按钮切换工作区/会话",
                     "后台执行时仍可发送 /use /sessions /status",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                     "已配置转写时，也可直接发送 Telegram 语音或音频消息",
@@ -673,41 +691,30 @@ class TgCodexService:
         )
 
     def _handle_sessions(self, chat_id: int, reply_to: int, arg: str, user_id: int) -> None:
-        limit = 10
         if arg:
-            try:
-                limit = max(1, min(30, int(arg)))
-            except ValueError:
-                self.api.send_message(chat_id, "参数错误，示例: /sessions 10", reply_to=reply_to)
-                return
-        items = self.sessions.list_recent(limit=limit)
-        if not items:
-            self.api.send_message(chat_id, "未找到本地会话记录。", reply_to=reply_to)
+            self.api.send_message(chat_id, "当前 /sessions 不需要参数，直接发送 /sessions 即可。", reply_to=reply_to)
             return
-        lines = ["最近会话（用 /use 编号 切换）:"]
-        session_ids = [s.session_id for s in items]
+        choices = build_workspace_choices(self.sessions)
+        if not choices:
+            self.api.send_message(chat_id, "未找到工作区。请先在 Codex 左侧边栏添加工作区。", reply_to=reply_to)
+            return
         keyboard_rows: List[List[Dict[str, str]]] = []
-        for i, s in enumerate(items, start=1):
-            short_id = s.session_id[:8]
-            cwd_name = Path(s.cwd).name or s.cwd
-            lines.append(f"{i}. {s.title} | {short_id} | {cwd_name}")
+        for i, choice in enumerate(choices, start=1):
             keyboard_rows.append(
                 [
                     {
-                        "text": f"切换 {i}",
-                        "callback_data": f"use:{s.session_id}",
+                        "text": f"{i}. {choice.name}",
+                        "callback_data": f"ws:{i}",
                     }
                 ]
             )
-        lines.append("直接发送编号即可切换（例如发送: 1）")
         self.api.send_message(
             chat_id,
-            "\n".join(lines),
+            format_workspace_choices_message(choices),
             reply_to=reply_to,
             reply_markup={"inline_keyboard": keyboard_rows},
         )
-        self.state.set_last_session_ids(user_id, session_ids)
-        self.state.set_pending_session_pick(user_id, True)
+        self.state.set_workspace_picker(user_id, [choice.root for choice in choices])
 
     def _handle_use(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
         selector = arg.strip()
@@ -729,7 +736,7 @@ class TgCodexService:
             self.api.send_message(chat_id, f"未找到 session: {session_id}", reply_to=reply_to)
             return
         self.state.set_active_session(user_id, meta.session_id, meta.cwd)
-        self.state.set_pending_session_pick(user_id, False)
+        self.state.clear_session_picker(user_id)
         self.api.send_message(
             chat_id,
             f"已切换到:\n{meta.title}\nsession: {meta.session_id}\ncwd: {meta.cwd}\n现在可直接发消息对话。",
@@ -743,15 +750,23 @@ class TgCodexService:
         if not raw.isdigit():
             return False
         idx = int(raw)
-        recent_ids = self.state.get_last_session_ids(user_id)
-        if idx <= 0 or idx > len(recent_ids):
-            self.api.send_message(
-                chat_id,
-                "编号无效。请发送 /sessions 重新查看列表。",
-                reply_to=reply_to,
-            )
+        picker = self.state.get_session_picker(user_id)
+        mode = str(picker.get("mode") or "")
+        if mode == "workspace":
+            self._open_workspace_sessions(chat_id, reply_to, user_id, idx)
             return True
-        self._switch_to_session(chat_id, reply_to, user_id, recent_ids[idx - 1])
+        if mode == "session":
+            workspace_root = str(picker.get("workspace_root") or "").strip()
+            session_ids = picker.get("session_ids")
+            if idx == 0 and workspace_root:
+                self._activate_workspace_new_session(chat_id, reply_to, user_id)
+                return True
+            if not isinstance(session_ids, list) or idx <= 0 or idx > len(session_ids):
+                self.api.send_message(chat_id, "会话编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
+                return True
+            self._switch_to_session(chat_id, reply_to, user_id, str(session_ids[idx - 1]))
+            return True
+        self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
         return True
 
     def _handle_history(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
@@ -864,10 +879,54 @@ class TgCodexService:
                 return
             target_cwd = candidate
         self.state.clear_active_session(user_id, str(target_cwd))
-        self.state.set_pending_session_pick(user_id, False)
+        self.state.clear_session_picker(user_id)
         self.api.send_message(
             chat_id,
-            f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",
+            f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会新建 session。",
+            reply_to=reply_to,
+        )
+
+    def _open_workspace_sessions(self, chat_id: int, reply_to: int, user_id: int, index: int) -> None:
+        picker = self.state.get_session_picker(user_id)
+        workspace_roots = picker.get("workspace_roots")
+        if not isinstance(workspace_roots, list) or index <= 0 or index > len(workspace_roots):
+            self.api.send_message(chat_id, "工作区编号无效。请发送 /sessions 重新查看列表。", reply_to=reply_to)
+            return
+        workspace_root = str(workspace_roots[index - 1])
+        workspace_sessions = list_workspace_sessions(self.sessions, workspace_root, limit=20)
+        keyboard_rows: List[List[Dict[str, str]]] = [[{"text": "0. 新建会话", "callback_data": "wsnew"}]]
+        for idx, item in enumerate(workspace_sessions, start=1):
+            keyboard_rows.append(
+                [
+                    {
+                        "text": f"{idx}. {item.title}",
+                        "callback_data": f"use:{item.session_id}",
+                    }
+                ]
+            )
+        self.api.send_message(
+            chat_id,
+            format_workspace_sessions_message(workspace_root, workspace_sessions),
+            reply_to=reply_to,
+            reply_markup={"inline_keyboard": keyboard_rows},
+        )
+        self.state.set_workspace_session_picker(
+            user_id,
+            workspace_root,
+            [item.session_id for item in workspace_sessions],
+        )
+
+    def _activate_workspace_new_session(self, chat_id: int, reply_to: int, user_id: int) -> None:
+        picker = self.state.get_session_picker(user_id)
+        workspace_root = str(picker.get("workspace_root") or "").strip()
+        if not workspace_root:
+            self.api.send_message(chat_id, "当前没有选中的工作区。请重新发送 /sessions。", reply_to=reply_to)
+            return
+        self.state.clear_active_session(user_id, workspace_root)
+        self.state.clear_session_picker(user_id)
+        self.api.send_message(
+            chat_id,
+            f"已进入新会话模式，cwd: {workspace_root}\n下一条普通消息会新建 session。",
             reply_to=reply_to,
         )
 
@@ -1148,14 +1207,21 @@ class TgCodexService:
             stream_state["last_emit_at_ms"] = now_ms
             stream_state["content_updates"] = int(stream_state.get("content_updates") or 0) + 1
 
+        def on_retry_status(status_text: str) -> None:
+            first_output.set()
+            if stream_message_id is not None:
+                edit_stream_message(self._format_prompt_response(session_label, status_text))
+
         typing = TypingStatus(self.api, chat_id)
         typing.start()
         try:
-            thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
+            execution = run_prompt_with_workspace_write_recovery(
+                self.codex,
                 prompt=prompt,
                 cwd=cwd,
                 session_id=active_id,
                 on_update=on_update if stream_message_id is not None else None,
+                on_retry_status=on_retry_status,
             )
         except Exception as e:
             thinking_stop.set()
@@ -1177,12 +1243,19 @@ class TgCodexService:
             typing.stop()
             self.running_prompts.finish(user_id, active_id)
 
+        thread_id = execution.thread_id
+        answer = execution.answer
+        stderr_text = execution.stderr_text
+        return_code = execution.return_code
+        verification = execution.verification
+
         elapsed_sec = round(time.time() - run_started_at, 2)
         first_output_sec = round(first_output_at[0] - run_started_at, 2) if first_output_at else None
         log(
             "prompt finished: "
             f"user_id={user_id} session={active_id} thread={thread_id} exit={return_code} "
-            f"elapsed_sec={elapsed_sec} first_output_sec={first_output_sec}"
+            f"elapsed_sec={elapsed_sec} first_output_sec={first_output_sec} "
+            f"retry_attempted={execution.retry_attempted} retry_recovered={execution.retry_recovered}"
         )
 
         final_session_id = thread_id or active_id
@@ -1214,6 +1287,13 @@ class TgCodexService:
                 if not active_id:
                     note = "新线程已创建，但你已经切到别的线程，当前活动线程未变。"
                 answer = f"{note}\n\n{answer}"
+
+        if verification.required and not verification.is_verified:
+            log(
+                "workspace write verification failed: "
+                f"user_id={user_id} cwd={verification.cwd} prompt_len={len(prompt.strip())}"
+            )
+            answer = format_missing_workspace_write_warning(answer, verification)
 
         answer = self._format_prompt_response(final_session_label, answer)
         if stream_message_id is not None:

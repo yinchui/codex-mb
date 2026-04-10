@@ -5,6 +5,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from codex_common import BotState, SessionStore
 from wechat_codex_service import (
@@ -47,6 +48,17 @@ def write_session_file(root: Path, session_id: str, cwd: str, title_prompt: str)
     target.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in payloads), encoding="utf-8")
 
 
+def write_codex_global_state(home_root: Path, workspace_roots) -> Path:
+    codex_dir = home_root / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    target = codex_dir / ".codex-global-state.json"
+    target.write_text(
+        json.dumps({"electron-saved-workspace-roots": [str(path) for path in workspace_roots]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return target
+
+
 class FakeCodexRunner:
     def __init__(self) -> None:
         self.calls = []
@@ -54,6 +66,59 @@ class FakeCodexRunner:
     def run_prompt(self, prompt, cwd, session_id=None, on_update=None):
         self.calls.append((prompt, str(cwd), session_id))
         return ("thread-123", f"answer:{prompt}", "", 0)
+
+
+class FakeCodexRunnerSyncClaim:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def run_prompt(self, prompt, cwd, session_id=None, on_update=None):
+        self.calls.append((prompt, str(cwd), session_id))
+        return ("thread-123", "已同步到 Obsidian，文件在 学习笔记/AI行业观察/note.md。", "", 0)
+
+
+class FakeCodexRunnerSyncClaimExistingNote:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def run_prompt(self, prompt, cwd, session_id=None, on_update=None):
+        self.calls.append((prompt, str(cwd), session_id))
+        return (
+            "thread-123",
+            "已同步到 Obsidian。\n\n文件路径是 2026-03-30-近期AI革命新闻与人类重启.md，存放在 `学习笔记/AI行业观察/`。",
+            "",
+            0,
+        )
+
+
+class FakeCodexRunnerRetrySync:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def run_prompt(self, prompt, cwd, session_id=None, on_update=None):
+        self.calls.append((prompt, str(cwd), session_id))
+        root = Path(cwd)
+        if len(self.calls) == 1:
+            return (
+                "thread-first",
+                "已同步到 Obsidian。\n\n文件路径是 2026-03-30-近期AI革命新闻与人类重启.md，存放在 `学习笔记/AI行业观察/`。",
+                "",
+                0,
+            )
+        note_path = root / "学习笔记" / "AI行业观察" / "2026-03-30-近期AI革命新闻与人类重启.md"
+        index_path = note_path.parent / "_index.md"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text("# repaired sync\n", encoding="utf-8")
+        index_path.write_text(
+            "- [[2026-03-30-近期AI革命新闻与人类重启.md]] - repaired entry\n",
+            encoding="utf-8",
+        )
+        return (
+            "thread-retry",
+            "已同步到 Obsidian。\n\n文件路径是 2026-03-30-近期AI革命新闻与人类重启.md，存放在 `学习笔记/AI行业观察/`。",
+            "",
+            0,
+        )
 
 
 class RecordingWechatAPI:
@@ -208,6 +273,9 @@ class WechatServiceTests(unittest.TestCase):
             root = Path(tmpdir)
             sessions_root = root / "sessions"
             write_session_file(sessions_root, "sess-1", str(root), "first prompt")
+            project_beta = root / "project-beta"
+            project_beta.mkdir(parents=True, exist_ok=True)
+            write_codex_global_state(root, [root, project_beta])
             api = RecordingWechatAPI()
             state = BotState(root / "state.json")
             service = RecordingWechatService(
@@ -222,39 +290,110 @@ class WechatServiceTests(unittest.TestCase):
                 account_store=WechatAccountStore(root / "wechat"),
             )
 
-            service._handle_message(
-                {
-                    "message_type": 1,
-                    "message_id": 1,
-                    "from_user_id": "user@im.wechat",
-                    "context_token": "ctx-1",
-                    "item_list": [{"type": 1, "text_item": {"text": "/sessions"}}],
-                }
-            )
-            self.assertTrue(any("最近会话" in text for _, _, text in api.sent))
+            with patch.dict("os.environ", {"HOME": str(root)}, clear=False):
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 1,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-1",
+                        "item_list": [{"type": 1, "text_item": {"text": "/sessions"}}],
+                    }
+                )
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 2,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-2",
+                        "item_list": [{"type": 1, "text_item": {"text": "1"}}],
+                    }
+                )
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 3,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-3",
+                        "item_list": [{"type": 1, "text_item": {"text": "1"}}],
+                    }
+                )
 
-            service._handle_message(
-                {
-                    "message_type": 1,
-                    "message_id": 2,
-                    "from_user_id": "user@im.wechat",
-                    "context_token": "ctx-2",
-                    "item_list": [{"type": 1, "text_item": {"text": "1"}}],
-                }
-            )
+            self.assertTrue(any("工作区列表" in text for _, _, text in api.sent))
+            self.assertTrue(any(f"工作区: {root}" in text for _, _, text in api.sent))
+            self.assertTrue(any("0. 新建会话" in text for _, _, text in api.sent))
+
             active_id, _ = state.get_active("user@im.wechat")
             self.assertEqual(active_id, "sess-1")
 
             service._handle_message(
                 {
                     "message_type": 1,
-                    "message_id": 3,
+                    "message_id": 4,
                     "from_user_id": "user@im.wechat",
-                    "context_token": "ctx-3",
+                    "context_token": "ctx-4",
                     "item_list": [{"type": 1, "text_item": {"text": "继续这个会话"}}],
                 }
             )
-            self.assertEqual(service.prompt_requests[-1], ("user@im.wechat", "ctx-3", "继续这个会话"))
+            self.assertEqual(service.prompt_requests[-1], ("user@im.wechat", "ctx-4", "继续这个会话"))
+
+    def test_workspace_picker_can_enter_new_session_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project_beta = root / "project-beta"
+            project_beta.mkdir(parents=True, exist_ok=True)
+            write_codex_global_state(root, [root, project_beta])
+
+            api = RecordingWechatAPI()
+            state = BotState(root / "state.json")
+            service = RecordingWechatService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=state,
+                codex=FakeCodexRunner(),
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            with patch.dict("os.environ", {"HOME": str(root)}, clear=False):
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 1,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-1",
+                        "item_list": [{"type": 1, "text_item": {"text": "/sessions"}}],
+                    }
+                )
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 2,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-2",
+                        "item_list": [{"type": 1, "text_item": {"text": "2"}}],
+                    }
+                )
+                service._handle_message(
+                    {
+                        "message_type": 1,
+                        "message_id": 3,
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "ctx-3",
+                        "item_list": [{"type": 1, "text_item": {"text": "0"}}],
+                    }
+                )
+
+            self.assertTrue(any("0. 新建会话" in text for _, _, text in api.sent))
+            self.assertTrue(any(f"工作区: {project_beta}" in text for _, _, text in api.sent))
+            self.assertTrue(any("下一条普通消息会新建 session" in text for _, _, text in api.sent))
+
+            active_id, active_cwd = state.get_active("user@im.wechat")
+            self.assertIsNone(active_id)
+            self.assertEqual(active_cwd, str(project_beta))
 
     def test_prompt_worker_sends_final_answer(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -282,6 +421,103 @@ class WechatServiceTests(unittest.TestCase):
                 "wechat prompt should not emit the removed ack text",
             )
             self.assertTrue(any("answer:hello" in text for _, _, text in api.sent))
+
+    def test_prompt_worker_warns_when_obsidian_sync_has_no_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            api = RecordingWechatAPI()
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=BotState(root / "state.json"),
+                codex=FakeCodexRunnerSyncClaim(),
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            service._run_prompt_worker(
+                "user@im.wechat",
+                "ctx-sync",
+                "把这条内容整理成 Obsidian 笔记，写入 学习笔记/AI行业观察，并更新 _index.md。",
+                None,
+                root,
+                "新会话 | vault",
+            )
+
+            self.assertTrue(any("未检测到当前工作区内有任何文件改动" in text for _, _, text in api.sent))
+            self.assertTrue(any("模型原始回复" in text for _, _, text in api.sent))
+
+    def test_prompt_worker_accepts_existing_note_and_index_without_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            note_path = root / "学习笔记" / "AI行业观察" / "2026-03-30-近期AI革命新闻与人类重启.md"
+            index_path = note_path.parent / "_index.md"
+            note_path.parent.mkdir(parents=True, exist_ok=True)
+            note_path.write_text("# existing note\n", encoding="utf-8")
+            index_path.write_text(
+                "- [[2026-03-30-近期AI革命新闻与人类重启.md]] - existing entry\n",
+                encoding="utf-8",
+            )
+
+            api = RecordingWechatAPI()
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=BotState(root / "state.json"),
+                codex=FakeCodexRunnerSyncClaimExistingNote(),
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            service._run_prompt_worker(
+                "user@im.wechat",
+                "ctx-sync-existing",
+                "3.00 复制打开抖音，帮我同步到obsidian",
+                None,
+                root,
+                "新会话 | vault",
+            )
+
+            self.assertFalse(any("未检测到当前工作区内有任何文件改动" in text for _, _, text in api.sent))
+            self.assertTrue(any("2026-03-30-近期AI革命新闻与人类重启.md" in text for _, _, text in api.sent))
+
+    def test_prompt_worker_retries_in_fresh_session_after_unverified_sync_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            codex = FakeCodexRunnerRetrySync()
+            api = RecordingWechatAPI()
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=BotState(root / "state.json"),
+                codex=codex,
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            service._run_prompt_worker(
+                "user@im.wechat",
+                "ctx-sync-retry",
+                "3.00 复制打开抖音，帮我同步到obsidian",
+                "existing-session",
+                root,
+                "当前会话 | vault",
+            )
+
+            self.assertEqual(len(codex.calls), 2)
+            self.assertEqual(codex.calls[0][2], "existing-session")
+            self.assertIsNone(codex.calls[1][2])
+            self.assertTrue(any("2026-03-30-近期AI革命新闻与人类重启.md" in text for _, _, text in api.sent))
+            self.assertFalse(any("未检测到当前工作区内有任何文件改动" in text for _, _, text in api.sent))
 
 
 if __name__ == "__main__":
