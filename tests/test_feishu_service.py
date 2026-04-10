@@ -10,8 +10,15 @@ from typing import Dict, Optional
 from uuid import uuid4
 from unittest.mock import MagicMock, patch
 
-from codex_common import BotState, RunningPromptRegistry, SessionStore
+from codex_common import (
+    BotState,
+    PromptExecutionResult,
+    RunningPromptRegistry,
+    SessionStore,
+    WorkspaceWriteVerification,
+)
 from feishu_longconn_service import FeishuCodexService, FeishuOwnerStateStore, build_service
+from personal_assistant_bridge import PersonalAssistantConfig
 
 
 def write_session_file(root: Path, session_id: str, cwd: str, title_prompt: str) -> None:
@@ -126,6 +133,7 @@ class FeishuServiceHarness(FeishuCodexService):
         self.state = kwargs["state"]
         self.codex = kwargs["codex"]
         self.default_cwd = kwargs["default_cwd"]
+        self.personal_assistant_config = kwargs.get("personal_assistant_config")
         self.allowed_open_ids = kwargs.get("allowed_open_ids")
         self.enable_p2p = kwargs.get("enable_p2p", True)
         self.ignore_old_message_seconds = kwargs.get("ignore_old_message_seconds", 0)
@@ -147,6 +155,22 @@ class FeishuServiceHarness(FeishuCodexService):
 
     def _run_prompt(self, chat_id: str, actor_id: str, prompt: str) -> None:
         self.prompt_calls.append((chat_id, actor_id, prompt))
+
+
+def success_result(thread_id: str, answer: str, cwd: Path) -> PromptExecutionResult:
+    return PromptExecutionResult(
+        thread_id=thread_id,
+        answer=answer,
+        stderr_text="",
+        return_code=0,
+        verification=WorkspaceWriteVerification(
+            required=False,
+            cwd=str(cwd),
+            changed_paths=[],
+            confirmed_paths=[],
+            claimed_paths_present=False,
+        ),
+    )
 
 
 class FeishuOwnerModeTests(unittest.TestCase):
@@ -587,6 +611,145 @@ class FeishuLoggingTests(unittest.TestCase):
             logged = "\n".join(str(call.args[0]) for call in log_mock.call_args_list)
             self.assertIn("command=/ask", logged)
             self.assertNotIn("~/.ssh/id_rsa", logged)
+
+
+class FeishuPersonalAssistantSidecarTests(unittest.TestCase):
+    def build_service(
+        self,
+        root: Path,
+        *,
+        assistant_cwd: Optional[Path] = None,
+    ):
+        api = FakeFeishuAPI()
+        sessions_root = root / "sessions"
+        write_session_file(sessions_root, "sess-1", str(root), "first prompt")
+        state = BotState(root / ".runtime" / "feishu_bot_state.json")
+        service = FeishuServiceHarness(
+            api=api,
+            sessions=SessionStore(sessions_root),
+            state=state,
+            codex=FakeCodexRunner(),
+            default_cwd=root,
+            runtime_dir=root / ".runtime" / "feishu",
+            enable_p2p=True,
+            personal_assistant_config=(
+                PersonalAssistantConfig(cwd=assistant_cwd, side_sync_enabled=True)
+                if assistant_cwd is not None
+                else None
+            ),
+        )
+        return service, api, state
+
+    def test_run_prompt_worker_runs_personal_assistant_sidecar_after_main_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_cwd = root / "project-a"
+            assistant_cwd = root / "assistant"
+            source_cwd.mkdir(parents=True, exist_ok=True)
+            assistant_cwd.mkdir(parents=True, exist_ok=True)
+            service, api, state = self.build_service(root, assistant_cwd=assistant_cwd)
+            state.set_active_session("ou-owner", "main-1", str(source_cwd))
+
+            with patch(
+                "feishu_longconn_service.run_prompt_with_workspace_write_recovery",
+                side_effect=[
+                    success_result("main-2", "主回复完成", source_cwd),
+                    success_result("pa-9", "同步完成", assistant_cwd),
+                ],
+            ) as run_mock:
+                service._run_prompt_worker(
+                    chat_id="chat-p2p",
+                    actor_id="ou-owner",
+                    prompt="今天把专利提纲补完",
+                    active_id="main-1",
+                    cwd=source_cwd,
+                    session_label="main",
+                )
+
+            self.assertEqual(run_mock.call_count, 2)
+            self.assertEqual(run_mock.call_args_list[0].kwargs["cwd"], source_cwd)
+            self.assertEqual(run_mock.call_args_list[1].kwargs["cwd"], assistant_cwd)
+            self.assertEqual(run_mock.call_args_list[1].kwargs["session_id"], None)
+            self.assertIn("personal-assistant-chat", run_mock.call_args_list[1].kwargs["prompt"])
+            self.assertIn("今天把专利提纲补完", run_mock.call_args_list[1].kwargs["prompt"])
+            self.assertEqual(state.get_active("ou-owner"), ("main-2", str(source_cwd)))
+            self.assertEqual(
+                state.get_aux_session("ou-owner", "personal_assistant"),
+                ("pa-9", str(assistant_cwd)),
+            )
+            agent_messages = [item for item in api.sent_messages if item[0] == "agent"]
+            self.assertEqual(len(agent_messages), 1)
+            self.assertIn("主回复完成", agent_messages[0][2])
+
+    def test_run_prompt_worker_skips_sidecar_inside_personal_assistant_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            assistant_cwd = root / "assistant"
+            assistant_cwd.mkdir(parents=True, exist_ok=True)
+            service, _, state = self.build_service(root, assistant_cwd=assistant_cwd)
+            state.set_active_session("ou-owner", "main-1", str(assistant_cwd))
+
+            with patch(
+                "feishu_longconn_service.run_prompt_with_workspace_write_recovery",
+                return_value=success_result("main-2", "主回复完成", assistant_cwd),
+            ) as run_mock:
+                service._run_prompt_worker(
+                    chat_id="chat-p2p",
+                    actor_id="ou-owner",
+                    prompt="同步一下今天的进度",
+                    active_id="main-1",
+                    cwd=assistant_cwd,
+                    session_label="main",
+                )
+
+            self.assertEqual(run_mock.call_count, 1)
+            self.assertEqual(state.get_active("ou-owner"), ("main-2", str(assistant_cwd)))
+            self.assertEqual(state.get_aux_session("ou-owner", "personal_assistant"), (None, None))
+
+    def test_build_service_reads_personal_assistant_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            assistant_cwd = root / "assistant"
+            assistant_cwd.mkdir(parents=True, exist_ok=True)
+
+            dispatcher_builder = MagicMock()
+            dispatcher_builder.register_p2_im_message_receive_v1.return_value = dispatcher_builder
+            dispatcher_builder.register_p2_im_chat_access_event_bot_p2p_chat_entered_v1.return_value = dispatcher_builder
+            dispatcher_builder.register_p2_im_chat_member_bot_added_v1.return_value = dispatcher_builder
+            dispatcher_builder.register_p2_im_chat_member_bot_deleted_v1.return_value = dispatcher_builder
+            dispatcher_builder.register_p2_customized_event.return_value = dispatcher_builder
+            dispatcher_builder.build.return_value = object()
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "FEISHU_APP_ID": "app-id",
+                    "FEISHU_APP_SECRET": "app-secret",
+                    "CODEX_SESSION_ROOT": str(root / "sessions"),
+                    "DEFAULT_CWD": str(root),
+                    "STATE_PATH": str(root / ".runtime" / "feishu_bot_state.json"),
+                    "PERSONAL_ASSISTANT_CWD": str(assistant_cwd),
+                    "PERSONAL_ASSISTANT_SIDE_SYNC_ENABLED": "1",
+                },
+                clear=True,
+            ), patch("feishu_longconn_service.FeishuAPI", return_value=FakeFeishuAPI()), patch(
+                "feishu_longconn_service.CodexRunner",
+                return_value=FakeCodexRunner(),
+            ), patch(
+                "feishu_longconn_service.resolve_codex_bin",
+                return_value="codex",
+            ), patch(
+                "feishu_longconn_service.lark.EventDispatcherHandler.builder",
+                return_value=dispatcher_builder,
+            ), patch(
+                "feishu_longconn_service.lark.ws.Client",
+                return_value=object(),
+            ):
+                service = build_service()
+
+            self.assertIsNotNone(service.personal_assistant_config)
+            self.assertEqual(service.personal_assistant_config.cwd, assistant_cwd)
+            self.assertTrue(service.personal_assistant_config.side_sync_enabled)
 
 
 if __name__ == "__main__":

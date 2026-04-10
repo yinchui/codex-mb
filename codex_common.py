@@ -895,6 +895,14 @@ class BotState:
             users[key] = {}
         return users[key]
 
+    def _get_aux_sessions_unlocked(self, user_id: StateActor) -> Dict[str, Dict[str, Any]]:
+        user_data = self._get_user_unlocked(user_id)
+        aux_sessions = user_data.get("aux_sessions")
+        if not isinstance(aux_sessions, dict):
+            aux_sessions = {}
+            user_data["aux_sessions"] = aux_sessions
+        return aux_sessions
+
     def set_active_session(self, user_id: StateActor, session_id: str, cwd: str) -> None:
         with self._lock:
             user_data = self._get_user_unlocked(user_id)
@@ -914,6 +922,44 @@ class BotState:
             user_data = self._get_user_unlocked(user_id)
             session_id = self._normalize_session_id(user_data.get("active_session_id"))
             cwd = str(user_data.get("active_cwd") or "").strip() or None
+            return session_id, cwd
+
+    def set_aux_session(
+        self,
+        user_id: StateActor,
+        namespace: str,
+        session_id: str,
+        cwd: str,
+    ) -> None:
+        with self._lock:
+            aux_sessions = self._get_aux_sessions_unlocked(user_id)
+            aux_sessions[str(namespace)] = {
+                "session_id": session_id,
+                "cwd": cwd,
+            }
+            self._save_unlocked()
+
+    def clear_aux_session(self, user_id: StateActor, namespace: str, cwd: str) -> None:
+        with self._lock:
+            aux_sessions = self._get_aux_sessions_unlocked(user_id)
+            aux_sessions[str(namespace)] = {
+                "session_id": None,
+                "cwd": cwd,
+            }
+            self._save_unlocked()
+
+    def get_aux_session(
+        self,
+        user_id: StateActor,
+        namespace: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        with self._lock:
+            aux_sessions = self._get_aux_sessions_unlocked(user_id)
+            session = aux_sessions.get(str(namespace))
+            if not isinstance(session, dict):
+                return None, None
+            session_id = self._normalize_session_id(session.get("session_id"))
+            cwd = str(session.get("cwd") or "").strip() or None
             return session_id, cwd
 
     def set_last_session_ids(self, user_id: StateActor, session_ids: List[str]) -> None:
@@ -957,6 +1003,30 @@ class BotState:
                 return False
             user_data["active_session_id"] = next_session_id
             user_data["active_cwd"] = cwd
+            self._save_unlocked()
+            return True
+
+    def update_aux_session_if_unchanged(
+        self,
+        user_id: StateActor,
+        namespace: str,
+        expected_session_id: Optional[str],
+        next_session_id: str,
+        cwd: str,
+    ) -> bool:
+        with self._lock:
+            aux_sessions = self._get_aux_sessions_unlocked(user_id)
+            key = str(namespace)
+            session = aux_sessions.get(key)
+            current_session_id = None
+            if isinstance(session, dict):
+                current_session_id = self._normalize_session_id(session.get("session_id"))
+            if current_session_id != self._normalize_session_id(expected_session_id):
+                return False
+            aux_sessions[key] = {
+                "session_id": next_session_id,
+                "cwd": cwd,
+            }
             self._save_unlocked()
             return True
 

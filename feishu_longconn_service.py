@@ -36,6 +36,11 @@ from codex_common import (
     resolve_codex_bin,
     run_prompt_with_workspace_write_recovery,
 )
+from personal_assistant_bridge import (
+    PersonalAssistantConfig,
+    build_sidecar_sync_prompt,
+    load_personal_assistant_config,
+)
 
 
 MAX_FEISHU_TEXT = 2000
@@ -510,6 +515,7 @@ class FeishuCodexService:
         stream_edit_interval_ms: int,
         stream_min_delta_chars: int,
         thinking_status_interval_ms: int,
+        personal_assistant_config: Optional[PersonalAssistantConfig] = None,
         runtime_dir: Optional[Path] = None,
         owner_mode_enabled: bool = True,
     ):
@@ -518,6 +524,7 @@ class FeishuCodexService:
         self.state = state
         self.codex = codex
         self.default_cwd = default_cwd
+        self.personal_assistant_config = personal_assistant_config
         self.allowed_open_ids = allowed_open_ids
         self.enable_p2p = enable_p2p
         self.ignore_old_message_seconds = max(0, ignore_old_message_seconds)
@@ -1324,9 +1331,82 @@ class FeishuCodexService:
         if use_stream and stream_message_id:
             replay = int(stream_state.get("content_updates") or 0) == 0
             self._finalize_stream_reply(chat_id, stream_message_id, answer, progressive_replay=replay)
+        else:
+            self.api.send_agent_message(chat_id, answer)
+
+        self._run_personal_assistant_sidecar_sync(
+            actor_id=actor_id,
+            user_text=prompt,
+            source_cwd=cwd,
+        )
+
+    def _run_personal_assistant_sidecar_sync(
+        self,
+        *,
+        actor_id: str,
+        user_text: str,
+        source_cwd: Path,
+    ) -> None:
+        assistant_cfg = self.personal_assistant_config
+        if assistant_cfg is None or not assistant_cfg.side_sync_enabled:
             return
 
-        self.api.send_agent_message(chat_id, answer)
+        source_root = source_cwd.expanduser().resolve(strict=False)
+        assistant_cwd = assistant_cfg.cwd.expanduser()
+        assistant_root = assistant_cwd.resolve(strict=False)
+        if source_root == assistant_root:
+            return
+
+        aux_namespace = "personal_assistant"
+        aux_session_id, _ = self.state.get_aux_session(actor_id, aux_namespace)
+        sidecar_prompt = build_sidecar_sync_prompt(
+            user_text=user_text,
+            source_cwd=source_cwd,
+            skill_path=assistant_cwd / "skills" / "personal-assistant-chat" / "SKILL.md",
+            state_dir=assistant_cwd / "state",
+        )
+        log(
+            "personal assistant sidecar start: "
+            f"actor={actor_id} source_cwd={source_root} assistant_cwd={assistant_root} "
+            f"session={aux_session_id}"
+        )
+        try:
+            execution = run_prompt_with_workspace_write_recovery(
+                self.codex,
+                prompt=sidecar_prompt,
+                cwd=assistant_cwd,
+                session_id=aux_session_id,
+            )
+        except Exception as err:
+            log(f"personal assistant sidecar failed: actor={actor_id} error={err}")
+            return
+
+        if execution.return_code != 0:
+            log(
+                "personal assistant sidecar failed: "
+                f"actor={actor_id} exit={execution.return_code} stderr_len={len(execution.stderr_text or '')}"
+            )
+            return
+
+        if execution.thread_id:
+            session_updated = self.state.update_aux_session_if_unchanged(
+                actor_id,
+                aux_namespace,
+                aux_session_id,
+                execution.thread_id,
+                str(assistant_cwd),
+            )
+            if not session_updated:
+                log(
+                    "personal assistant sidecar skipped stale session update: "
+                    f"actor={actor_id} expected={aux_session_id} next={execution.thread_id}"
+                )
+                return
+
+        log(
+            "personal assistant sidecar finished: "
+            f"actor={actor_id} thread={execution.thread_id} answer_len={len(execution.answer or '')}"
+        )
 
 
 def build_service() -> FeishuCodexService:
@@ -1369,6 +1449,7 @@ def build_service() -> FeishuCodexService:
         env("FEISHU_IGNORE_OLD_MESSAGE_SECONDS", "180"),
         180,
     )
+    personal_assistant_config = load_personal_assistant_config(os.environ)
 
     api = FeishuAPI(
         app_id=app_id,
@@ -1409,6 +1490,7 @@ def build_service() -> FeishuCodexService:
         stream_edit_interval_ms=stream_edit_interval_ms,
         stream_min_delta_chars=stream_min_delta_chars,
         thinking_status_interval_ms=thinking_status_interval_ms,
+        personal_assistant_config=personal_assistant_config,
         runtime_dir=runtime_dir,
         owner_mode_enabled=owner_mode_enabled,
     )

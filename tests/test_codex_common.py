@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex_common import (
+    BotState,
     CodexRunner,
     PromptPreparation,
     capture_workspace_snapshot_for_prompt,
@@ -248,6 +249,20 @@ class DouyinPromptPreparationTests(unittest.TestCase):
         self.assertEqual(len(codex.calls), 1)
         self.assertEqual(codex.calls[0][2], "sess-1")
         self.assertIn("预处理材料: 第一段逐字稿", codex.calls[0][0])
+
+
+class BotStateAuxSessionTests(unittest.TestCase):
+    def test_tracks_aux_session_without_overwriting_active_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = BotState(Path(tmpdir) / "feishu_bot_state.json")
+            state.set_active_session("ou-owner", "main-1", "/tmp/main")
+            state.set_aux_session("ou-owner", "personal_assistant", "pa-1", "/tmp/assistant")
+
+            self.assertEqual(state.get_active("ou-owner"), ("main-1", "/tmp/main"))
+            self.assertEqual(
+                state.get_aux_session("ou-owner", "personal_assistant"),
+                ("pa-1", "/tmp/assistant"),
+            )
 
 
 if __name__ == "__main__":
